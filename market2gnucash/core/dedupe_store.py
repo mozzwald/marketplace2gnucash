@@ -30,6 +30,17 @@ class DedupeStore:
             )
             conn.commit()
 
+    def import_count(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM imports").fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_all(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM imports")
+            conn.commit()
+        self._init_db()
+
     def existing_keys(self, book_id: str, dedupe_keys: list[str]) -> set[str]:
         if not dedupe_keys:
             return set()

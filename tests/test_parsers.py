@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+import tempfile
 import unittest
 
-from market2gnucash.core.parsers import parse_ebay_report, parse_etsy_inputs, parse_etsy_statement
+from market2gnucash.core.parsers import (
+    parse_bank_statement_file,
+    parse_ebay_report,
+    parse_etsy_inputs,
+    parse_etsy_statement,
+)
+from market2gnucash.core.models import BankCsvProfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +52,114 @@ class ParserTests(unittest.TestCase):
         listing_rows = [row for row in rows if row.title == "Listing fee"]
         self.assertGreater(len(listing_rows), 0)
         self.assertTrue(all(row.listing_id for row in listing_rows))
+
+    def test_parse_bank_csv_with_debit_credit_columns(self) -> None:
+        csv_text = "\n".join(
+            [
+                "Date,Description,Debit,Credit,Reference,Currency",
+                "03/01/2026,Coffee Shop,4.50,,A1,USD",
+                "03/02/2026,Payroll,,1500.00,A2,USD",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "statement.csv"
+            path.write_text(csv_text, encoding="utf-8")
+
+            statement = parse_bank_statement_file(path)
+
+        self.assertEqual(statement.source_format, "csv")
+        self.assertEqual(len(statement.rows), 2)
+        self.assertEqual(statement.currency, "USD")
+        self.assertEqual(statement.rows[0].amount, Decimal("-4.50"))
+        self.assertEqual(statement.rows[1].amount, Decimal("1500.00"))
+        self.assertEqual(statement.rows[0].fitid, "A1")
+
+    def test_parse_bank_ofx_sgml_statement(self) -> None:
+        ofx_text = "\n".join(
+            [
+                "OFXHEADER:100",
+                "DATA:OFXSGML",
+                "VERSION:102",
+                "",
+                "<OFX>",
+                "<CURDEF>USD",
+                "<BANKMSGSRSV1>",
+                "<STMTTRNRS>",
+                "<STMTRS>",
+                "<BANKACCTFROM>",
+                "<ACCTID>123456789",
+                "</BANKACCTFROM>",
+                "<BANKTRANLIST>",
+                "<STMTTRN>",
+                "<TRNTYPE>DEBIT",
+                "<DTPOSTED>20260301120000[-6:CST]",
+                "<TRNAMT>-12.34",
+                "<FITID>fit-1",
+                "<NAME>Bookstore",
+                "<MEMO>Order 55",
+                "</STMTTRN>",
+                "<STMTTRN>",
+                "<TRNTYPE>CREDIT",
+                "<DTPOSTED>20260302120000[-6:CST]",
+                "<TRNAMT>200.00",
+                "<FITID>fit-2",
+                "<NAME>Refund",
+                "</STMTTRN>",
+                "</BANKTRANLIST>",
+                "</STMTRS>",
+                "</STMTTRNRS>",
+                "</BANKMSGSRSV1>",
+                "</OFX>",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "statement.ofx"
+            path.write_text(ofx_text, encoding="utf-8")
+
+            statement = parse_bank_statement_file(path)
+
+        self.assertEqual(statement.source_format, "ofx")
+        self.assertEqual(statement.account_id, "123456789")
+        self.assertEqual(statement.currency, "USD")
+        self.assertEqual(len(statement.rows), 2)
+        self.assertEqual(statement.rows[0].amount, Decimal("-12.34"))
+        self.assertEqual(statement.rows[0].fitid, "fit-1")
+        self.assertEqual(statement.rows[0].memo, "Order 55")
+
+    def test_parse_sample_hometown_csv(self) -> None:
+        statement = parse_bank_statement_file(SAMPLES / "hometown.csv")
+
+        self.assertEqual(statement.source_format, "csv")
+        self.assertEqual(statement.account_id, "336661")
+        self.assertEqual(len(statement.rows), 43)
+        self.assertEqual(statement.rows[0].amount, Decimal("45.09"))
+        self.assertIn("PAYMENTS eBay", statement.rows[0].description)
+
+    def test_parse_sample_credit_card_headerless_csv(self) -> None:
+        statement = parse_bank_statement_file(SAMPLES / "CreditCard1.csv")
+
+        self.assertEqual(statement.source_format, "csv")
+        self.assertEqual(len(statement.rows), 55)
+        self.assertEqual(statement.rows[0].amount, Decimal("-100.00"))
+        self.assertEqual(statement.rows[0].description, "PIRATE SHIP * POSTAGE PRT.SH WY")
+        self.assertEqual(statement.rows[0].account_name, "CreditCard1")
+
+    def test_parse_headerless_csv_with_explicit_profile(self) -> None:
+        profile = BankCsvProfile(
+            has_header=False,
+            date_column="__col_0__",
+            amount_column="__col_1__",
+            memo_column="__col_3__",
+            description_column="__col_4__",
+        )
+
+        statement = parse_bank_statement_file(SAMPLES / "CreditCard1.csv", csv_profile=profile)
+
+        self.assertEqual(len(statement.rows), 55)
+        self.assertEqual(statement.rows[2].amount, Decimal("-20.00"))
+        self.assertIn("OPENAI", statement.rows[2].description)
 
 
 if __name__ == "__main__":

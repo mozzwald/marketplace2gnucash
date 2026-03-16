@@ -86,6 +86,67 @@ class EbayInputData:
 
 
 @dataclass(frozen=True)
+class BankStatementRow:
+    row_id: str
+    row_number: int
+    date: date
+    amount: Decimal
+    currency: str | None
+    description: str
+    memo: str
+    fitid: str | None
+    check_number: str | None
+    transaction_type: str | None
+    account_id: str | None
+    account_name: str | None
+    source_path: str
+    source_format: str
+    raw: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class BankStatementData:
+    source_path: str
+    source_format: str
+    account_id: str | None
+    account_name: str | None
+    currency: str | None
+    rows: tuple[BankStatementRow, ...]
+
+
+@dataclass(frozen=True)
+class BankCsvProfile:
+    has_header: bool = True
+    date_column: str | None = None
+    amount_column: str | None = None
+    debit_column: str | None = None
+    credit_column: str | None = None
+    description_column: str | None = None
+    memo_column: str | None = None
+    id_column: str | None = None
+    check_number_column: str | None = None
+    currency_column: str | None = None
+    account_id_column: str | None = None
+    account_name_column: str | None = None
+
+
+@dataclass(frozen=True)
+class BankImportSpec:
+    account_guid: str | None
+    statement_paths: tuple[str, ...]
+    csv_profiles: Mapping[str, BankCsvProfile] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CsvPreviewData:
+    path: str
+    delimiter: str
+    has_header: bool
+    columns: tuple[str, ...]
+    sample_rows: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class MappingConfig:
     etsy_clearing_guid: str | None = None
     etsy_income_guid: str | None = None
@@ -93,8 +154,12 @@ class MappingConfig:
     ebay_clearing_guid: str | None = None
     ebay_income_guid: str | None = None
     ebay_refunds_guid: str | None = None
+    bank_suspense_guid: str | None = None
     etsy_fee_accounts: Mapping[str, str] = field(default_factory=dict)
     ebay_fee_accounts: Mapping[str, str] = field(default_factory=dict)
+    bank_match_overrides: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    bank_merchant_accounts: Mapping[str, str] = field(default_factory=dict)
+    bank_txn_account_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -128,8 +193,42 @@ class PlannedTransactionStatus:
 
 
 @dataclass(frozen=True)
+class BankMatchTarget:
+    account_guid: str
+    amount: Decimal
+    memo: str
+
+
+@dataclass(frozen=True)
+class BankMatchResult:
+    bank_dedupe_key: str
+    bank_txn_id: str
+    bank_description: str
+    bank_date: date
+    bank_amount: Decimal
+    status: str
+    match_source: str
+    matched_transaction_ids: tuple[str, ...]
+    targets: tuple[BankMatchTarget, ...]
+
+
+@dataclass(frozen=True)
+class BankCategoryResult:
+    bank_dedupe_key: str
+    bank_txn_id: str
+    merchant_key: str
+    description: str
+    txn_date: date
+    amount: Decimal
+    mapped_account_guid: str | None
+    mapping_source: str
+
+
+@dataclass(frozen=True)
 class PlanResult:
     transactions: tuple[PlannedTransactionStatus, ...]
     warnings: tuple[str, ...]
     etsy_mapping_keys: tuple[str, ...]
     ebay_fee_columns: tuple[str, ...]
+    bank_match_results: tuple[BankMatchResult, ...]
+    bank_category_results: tuple[BankCategoryResult, ...]

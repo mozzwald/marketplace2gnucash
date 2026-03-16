@@ -74,6 +74,7 @@ class PreviewTab(QWidget):
         use_range = bool(inputs.get("use_date_range"))
         start_date = date.fromisoformat(inputs["start_date"]) if use_range and inputs.get("start_date") else None
         end_date = date.fromisoformat(inputs["end_date"]) if use_range and inputs.get("end_date") else None
+        bank_imports = inputs.get("bank_imports", [])
 
         try:
             plan = build_plan(
@@ -83,6 +84,7 @@ class PreviewTab(QWidget):
                 etsy_statement_path=inputs.get("etsy_statement_path"),
                 etsy_sold_orders_path=inputs.get("etsy_sold_orders_path"),
                 ebay_report_path=inputs.get("ebay_report_path"),
+                bank_imports=bank_imports,
                 start_date=start_date,
                 end_date=end_date,
             )

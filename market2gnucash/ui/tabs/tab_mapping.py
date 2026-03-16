@@ -3,21 +3,18 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QHeaderView,
     QVBoxLayout,
     QWidget,
 )
@@ -25,73 +22,7 @@ from PySide6.QtWidgets import (
 from market2gnucash.core.models import AccountRecord, MappingConfig
 from market2gnucash.core.parsers import parse_ebay_report, parse_etsy_statement
 from market2gnucash.core.rules import etsy_mapping_key
-
-
-class AccountPickerDialog(QDialog):
-    def __init__(
-        self,
-        accounts: tuple[AccountRecord, ...],
-        *,
-        selected_guid: str | None,
-        allowed_types: set[str] | None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Select account")
-        self.resize(700, 500)
-
-        self._accounts_by_guid = {account.guid: account for account in accounts}
-
-        layout = QVBoxLayout(self)
-        self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Account", "Type"])
-        header = self.tree.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        layout.addWidget(self.tree)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-        nodes_by_path: dict[tuple[str, ...], QTreeWidgetItem] = {}
-        for account in sorted(accounts, key=lambda value: value.full_name):
-            if account.account_type == "ROOT" or not account.full_name:
-                continue
-
-            parts = account.full_name.split(":")
-            parent_item = self.tree.invisibleRootItem()
-            for depth in range(len(parts)):
-                path = tuple(parts[: depth + 1])
-                node = nodes_by_path.get(path)
-                if node is None:
-                    node = QTreeWidgetItem([parts[depth], ""])
-                    parent_item.addChild(node)
-                    nodes_by_path[path] = node
-                parent_item = node
-
-            parent_item.setText(1, account.account_type)
-            parent_item.setData(0, Qt.UserRole, account.guid)
-
-            if allowed_types and account.account_type not in allowed_types:
-                parent_item.setDisabled(True)
-
-            if selected_guid and account.guid == selected_guid:
-                self.tree.setCurrentItem(parent_item)
-
-        self.tree.expandToDepth(2)
-
-    def selected_guid(self) -> str | None:
-        item = self.tree.currentItem()
-        if item is None:
-            return None
-        guid = item.data(0, Qt.UserRole)
-        if isinstance(guid, str) and guid:
-            return guid
-        return None
+from market2gnucash.ui.account_picker import AccountPickerDialog
 
 
 class MappingTab(QWidget):
@@ -164,7 +95,6 @@ class MappingTab(QWidget):
 
         etsy_keys = set(self.app_state.get("etsy_mapping_keys", ()))
         ebay_columns = set(self.app_state.get("ebay_fee_columns", ()))
-
         plan = self.app_state.get("plan_result")
         if plan is not None:
             etsy_keys.update(plan.etsy_mapping_keys)
@@ -181,7 +111,6 @@ class MappingTab(QWidget):
 
         etsy_keys: set[str] = set(self.app_state.get("etsy_mapping_keys", ()))
         ebay_columns: set[str] = set(self.app_state.get("ebay_fee_columns", ()))
-
         try:
             statement_path = inputs.get("etsy_statement_path")
             if statement_path:
@@ -317,7 +246,7 @@ class MappingTab(QWidget):
 
         self._save_mapping(updated)
 
-    def _save_mapping(self, mapping: MappingConfig) -> None:
+    def _save_mapping(self, mapping: MappingConfig, refresh_plan: bool = False) -> None:
         self.app_state["mapping_config"] = mapping
         book_id = self.app_state.get("book_id")
         if book_id:

@@ -3,9 +3,16 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
+import re
 
 from market2gnucash.core.decimal_utils import ZERO
 from market2gnucash.core.models import (
+    BankCategoryResult,
+    BankMatchResult,
+    BankMatchTarget,
+    BankImportSpec,
+    BankStatementData,
     EbayInputData,
     EbayReportRow,
     EtsyInputData,
@@ -14,6 +21,30 @@ from market2gnucash.core.models import (
     PlannedSplit,
     PlannedTransaction,
 )
+
+_BANK_NOISE_TOKENS = {
+    "purchase",
+    "payment",
+    "payments",
+    "debit",
+    "credit",
+    "pending",
+    "posted",
+    "card",
+    "visa",
+    "mastercard",
+    "auth",
+    "authorization",
+    "trans",
+    "trn",
+    "nte",
+    "rmr",
+    "dda",
+    "pos",
+    "checkcard",
+    "withdrawal",
+    "deposit",
+}
 
 
 def etsy_mapping_key(row: EtsyStatementRow) -> str:
@@ -29,6 +60,27 @@ def etsy_mapping_key_candidates(row: EtsyStatementRow) -> tuple[str, ...]:
 
 def ebay_mapping_key(column_name: str) -> str:
     return f"ebay:fee_col:{column_name}"
+
+
+def bank_merchant_key(description: str) -> str:
+    tokens = re.findall(r"[a-z0-9]+", description.lower())
+    filtered: list[str] = []
+    for token in tokens:
+        if token in _BANK_NOISE_TOKENS:
+            continue
+        if token.isdigit():
+            continue
+        if any(char.isdigit() for char in token):
+            letters_only = "".join(char for char in token if char.isalpha())
+            if len(letters_only) < 3:
+                continue
+            token = letters_only
+        if len(token) < 2:
+            continue
+        filtered.append(token)
+    if not filtered:
+        return "uncategorized"
+    return " ".join(filtered[:6])
 
 
 def _split_sum(splits: list[PlannedSplit]) -> Decimal:
@@ -67,6 +119,13 @@ def _finalize_transaction(
         splits=tuple(splits),
         source_row_ids=tuple(source_row_ids),
         warnings=tuple(warnings),
+    )
+
+
+def _has_blocking_warnings(transaction: PlannedTransaction) -> bool:
+    return any(
+        warning.startswith(("MISSING_ACCOUNT", "UNMAPPED", "UNBALANCED", "MATCH_AMBIGUOUS"))
+        for warning in transaction.warnings
     )
 
 
@@ -599,3 +658,379 @@ def build_ebay_transactions(
     transactions.sort(key=lambda txn: (txn.date, txn.marketplace, txn.txn_kind, txn.txn_id))
     fee_columns = tuple(sorted(data.fee_columns))
     return tuple(transactions), tuple(warnings), fee_columns
+
+
+def build_bank_transactions(
+    bank_imports: tuple[tuple[BankImportSpec, tuple[BankStatementData, ...]], ...],
+    mapping: MappingConfig,
+    marketplace_transactions: tuple[PlannedTransaction, ...],
+) -> tuple[
+    tuple[PlannedTransaction, ...],
+    tuple[str, ...],
+    tuple[BankMatchResult, ...],
+    tuple[BankCategoryResult, ...],
+]:
+    transactions: list[PlannedTransaction] = []
+    warnings: list[str] = []
+    match_results: list[BankMatchResult] = []
+    category_results: list[BankCategoryResult] = []
+    used_marketplace_keys: set[str] = set()
+
+    eligible_marketplace_transactions = [
+        txn
+        for txn in marketplace_transactions
+        if not _has_blocking_warnings(txn)
+        and (
+            (mapping.etsy_clearing_guid and any(split.account_guid == mapping.etsy_clearing_guid for split in txn.splits))
+            or (mapping.ebay_clearing_guid and any(split.account_guid == mapping.ebay_clearing_guid for split in txn.splits))
+        )
+    ]
+
+    for bank_import, statements in bank_imports:
+        selected_account_guid = bank_import.account_guid
+        import_key = selected_account_guid or "unselected-account"
+
+        for statement in statements:
+            if not statement.rows:
+                warnings.append(
+                    f"INFO: Bank/Card statement {statement.source_path} contained no rows in the selected date range"
+                )
+                continue
+
+            for row in statement.rows:
+                txn_warnings: list[str] = []
+                txn_id = row.fitid or row.row_id
+                bank_label = statement.account_id or statement.account_name or Path(statement.source_path).name
+                description = row.description or row.memo or f"Bank/Card entry {txn_id}"
+                source_ids = [row.row_id]
+                dedupe_key = f"bank:{import_key}:{txn_id}"
+                merchant_key = bank_merchant_key(description)
+
+                if selected_account_guid is None:
+                    txn_warnings.append(
+                        "MISSING_ACCOUNT: No destination bank/card account selected for this import bundle"
+                    )
+
+                if row.amount == ZERO:
+                    txn_warnings.append(f"INFO: Zero-amount bank/card row {txn_id}")
+
+                match_result = _find_marketplace_match(
+                    bank_date=row.date,
+                    bank_amount=row.amount,
+                    eligible_marketplace_transactions=eligible_marketplace_transactions,
+                    used_marketplace_keys=used_marketplace_keys,
+                    bank_description=description,
+                    bank_dedupe_key=dedupe_key,
+                    bank_txn_id=txn_id,
+                    override_ids=mapping.bank_match_overrides.get(dedupe_key, ()),
+                )
+                match_results.append(match_result)
+
+                splits = [
+                    PlannedSplit(
+                        account_guid=selected_account_guid,
+                        amount=row.amount,
+                        memo=description,
+                        mapping_key="bank:account",
+                    )
+                ]
+
+                if match_result.status == "matched":
+                    for target in match_result.targets:
+                        splits.append(
+                            PlannedSplit(
+                                account_guid=target.account_guid,
+                                amount=target.amount,
+                                memo=target.memo,
+                                mapping_key="bank:matched-clearing",
+                            )
+                        )
+                    used_marketplace_keys.update(match_result.matched_transaction_ids)
+                else:
+                    if match_result.status == "ambiguous":
+                        txn_warnings.append(
+                            f"MATCH_AMBIGUOUS: Multiple marketplace match sets found for bank/card row {txn_id}"
+                        )
+                    if match_result.status == "invalid_override":
+                        txn_warnings.append(
+                            f"MATCH_OVERRIDE_INVALID: Manual bank/card match override is invalid for row {txn_id}"
+                        )
+                    txn_override_guid = mapping.bank_txn_account_overrides.get(dedupe_key)
+                    merchant_account_guid = mapping.bank_merchant_accounts.get(merchant_key)
+                    counterparty_guid = txn_override_guid or merchant_account_guid
+                    if match_result.status == "unmatched" and counterparty_guid:
+                        splits.append(
+                            PlannedSplit(
+                                account_guid=counterparty_guid,
+                                amount=-row.amount,
+                                memo=description,
+                                mapping_key=(
+                                    "bank:txn-override"
+                                    if txn_override_guid
+                                    else f"bank:merchant:{merchant_key}"
+                                ),
+                            )
+                        )
+                        category_results.append(
+                            BankCategoryResult(
+                                bank_dedupe_key=dedupe_key,
+                                bank_txn_id=txn_id,
+                                merchant_key=merchant_key,
+                                description=description,
+                                txn_date=row.date,
+                                amount=row.amount,
+                                mapped_account_guid=counterparty_guid,
+                                mapping_source="transaction" if txn_override_guid else "merchant",
+                            )
+                        )
+                    else:
+                        if match_result.status == "unmatched":
+                            txn_warnings.append(
+                                f"UNMAPPED: No bank/card counterparty mapping for row {txn_id}"
+                            )
+                        splits.append(
+                            PlannedSplit(
+                                account_guid=None,
+                                amount=-row.amount,
+                                memo=description,
+                                mapping_key="bank:unmapped",
+                            )
+                        )
+                        if match_result.status == "unmatched":
+                            category_results.append(
+                                BankCategoryResult(
+                                    bank_dedupe_key=dedupe_key,
+                                    bank_txn_id=txn_id,
+                                    merchant_key=merchant_key,
+                                    description=description,
+                                    txn_date=row.date,
+                                    amount=row.amount,
+                                    mapped_account_guid=None,
+                                    mapping_source="unmapped",
+                                )
+                            )
+
+                transactions.append(
+                    _finalize_transaction(
+                        dedupe_key=dedupe_key,
+                        marketplace="bank",
+                        txn_kind="statement",
+                        txn_id=txn_id,
+                        txn_date=row.date,
+                        description=f"{bank_label}: {description}",
+                        external_ref=row.fitid or row.row_id,
+                        clearing_amount=row.amount,
+                        splits=splits,
+                        source_row_ids=source_ids,
+                        warnings=txn_warnings,
+                    )
+                )
+
+    transactions.sort(key=lambda txn: (txn.date, txn.marketplace, txn.txn_kind, txn.txn_id))
+    category_results.sort(key=lambda result: (result.txn_date, result.description, result.bank_txn_id))
+    return tuple(transactions), tuple(warnings), tuple(match_results), tuple(category_results)
+
+
+def _find_marketplace_match(
+    *,
+    bank_date: date,
+    bank_amount: Decimal,
+    eligible_marketplace_transactions: list[PlannedTransaction],
+    used_marketplace_keys: set[str],
+    bank_description: str,
+    bank_dedupe_key: str,
+    bank_txn_id: str,
+    override_ids: tuple[str, ...],
+) -> BankMatchResult:
+    if override_ids:
+        return _resolve_manual_override(
+            override_ids=override_ids,
+            bank_date=bank_date,
+            bank_amount=bank_amount,
+            eligible_marketplace_transactions=eligible_marketplace_transactions,
+            bank_description=bank_description,
+            bank_dedupe_key=bank_dedupe_key,
+            bank_txn_id=bank_txn_id,
+        )
+
+    candidates = [
+        txn
+        for txn in eligible_marketplace_transactions
+        if txn.dedupe_key not in used_marketplace_keys
+        and txn.clearing_amount != ZERO
+        and (
+            bank_amount == ZERO
+            or (txn.clearing_amount > ZERO and bank_amount > ZERO)
+            or (txn.clearing_amount < ZERO and bank_amount < ZERO)
+        )
+    ]
+    candidates = [
+        txn
+        for txn in candidates
+        if abs((bank_date - txn.date).days) <= 7
+    ]
+    candidates.sort(key=lambda txn: (abs((bank_date - txn.date).days), txn.date, txn.txn_id))
+    candidates = candidates[:10]
+
+    matches = _find_exact_transaction_subsets(candidates, bank_amount)
+    if len(matches) == 1:
+        matched_transactions = tuple(sorted(matches[0], key=lambda txn: (txn.date, txn.txn_id, txn.dedupe_key)))
+        grouped_targets: dict[str, Decimal] = defaultdict(lambda: ZERO)
+        for txn in matched_transactions:
+            clearing_guid = _find_clearing_account_guid(txn)
+            if clearing_guid is None:
+                continue
+            grouped_targets[clearing_guid] += txn.clearing_amount
+        targets = tuple(
+            BankMatchTarget(
+                account_guid=account_guid,
+                amount=-amount,
+                memo=f"Matched clearing for {bank_description}",
+            )
+            for account_guid, amount in sorted(grouped_targets.items())
+        )
+        return BankMatchResult(
+            bank_dedupe_key=bank_dedupe_key,
+            bank_txn_id=bank_txn_id,
+            bank_description=bank_description,
+            bank_date=bank_date,
+            bank_amount=bank_amount,
+            status="matched",
+            match_source="auto",
+            matched_transaction_ids=tuple(txn.dedupe_key for txn in matched_transactions),
+            targets=targets,
+        )
+
+    status = "ambiguous" if len(matches) > 1 else "unmatched"
+    return BankMatchResult(
+        bank_dedupe_key=bank_dedupe_key,
+        bank_txn_id=bank_txn_id,
+        bank_description=bank_description,
+        bank_date=bank_date,
+        bank_amount=bank_amount,
+        status=status,
+        match_source="auto",
+        matched_transaction_ids=(),
+        targets=(),
+    )
+
+
+def _resolve_manual_override(
+    *,
+    override_ids: tuple[str, ...],
+    bank_date: date,
+    bank_amount: Decimal,
+    eligible_marketplace_transactions: list[PlannedTransaction],
+    bank_description: str,
+    bank_dedupe_key: str,
+    bank_txn_id: str,
+) -> BankMatchResult:
+    by_id = {txn.dedupe_key: txn for txn in eligible_marketplace_transactions}
+    matched_transactions: list[PlannedTransaction] = []
+    for override_id in override_ids:
+        txn = by_id.get(override_id)
+        if txn is None:
+            return BankMatchResult(
+                bank_dedupe_key=bank_dedupe_key,
+                bank_txn_id=bank_txn_id,
+                bank_description=bank_description,
+                bank_date=bank_date,
+                bank_amount=bank_amount,
+                status="invalid_override",
+                match_source="manual",
+                matched_transaction_ids=override_ids,
+                targets=(),
+            )
+        matched_transactions.append(txn)
+
+    total = ZERO
+    grouped_targets: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for txn in matched_transactions:
+        total += txn.clearing_amount
+        clearing_guid = _find_clearing_account_guid(txn)
+        if clearing_guid is None:
+            return BankMatchResult(
+                bank_dedupe_key=bank_dedupe_key,
+                bank_txn_id=bank_txn_id,
+                bank_description=bank_description,
+                bank_date=bank_date,
+                bank_amount=bank_amount,
+                status="invalid_override",
+                match_source="manual",
+                matched_transaction_ids=override_ids,
+                targets=(),
+            )
+        grouped_targets[clearing_guid] += txn.clearing_amount
+
+    if total != bank_amount:
+        return BankMatchResult(
+            bank_dedupe_key=bank_dedupe_key,
+            bank_txn_id=bank_txn_id,
+            bank_description=bank_description,
+            bank_date=bank_date,
+            bank_amount=bank_amount,
+            status="invalid_override",
+            match_source="manual",
+            matched_transaction_ids=override_ids,
+            targets=(),
+        )
+
+    targets = tuple(
+        BankMatchTarget(
+            account_guid=account_guid,
+            amount=-amount,
+            memo=f"Matched clearing for {bank_description}",
+        )
+        for account_guid, amount in sorted(grouped_targets.items())
+    )
+    return BankMatchResult(
+        bank_dedupe_key=bank_dedupe_key,
+        bank_txn_id=bank_txn_id,
+        bank_description=bank_description,
+        bank_date=bank_date,
+        bank_amount=bank_amount,
+        status="matched",
+        match_source="manual",
+        matched_transaction_ids=override_ids,
+        targets=targets,
+    )
+
+
+def _find_clearing_account_guid(transaction: PlannedTransaction) -> str | None:
+    for split in transaction.splits:
+        if split.amount == transaction.clearing_amount and split.account_guid:
+            return split.account_guid
+    return None
+
+
+def _find_exact_transaction_subsets(
+    candidates: list[PlannedTransaction],
+    target_amount: Decimal,
+) -> list[tuple[PlannedTransaction, ...]]:
+    if not candidates:
+        return []
+
+    matches: list[tuple[PlannedTransaction, ...]] = []
+
+    def dfs(start_index: int, current: list[PlannedTransaction], running_total: Decimal) -> None:
+        if running_total == target_amount and current:
+            matches.append(tuple(current))
+            return
+        if len(current) >= 6 or len(matches) > 1:
+            return
+
+        for index in range(start_index, len(candidates)):
+            candidate = candidates[index]
+            next_total = running_total + candidate.clearing_amount
+            if target_amount >= ZERO and next_total > target_amount:
+                continue
+            if target_amount < ZERO and next_total < target_amount:
+                continue
+            current.append(candidate)
+            dfs(index + 1, current, next_total)
+            current.pop()
+            if len(matches) > 1:
+                return
+
+    dfs(0, [], ZERO)
+    return matches

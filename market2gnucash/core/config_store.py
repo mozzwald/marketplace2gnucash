@@ -43,6 +43,43 @@ class ConfigStore:
         data.setdefault("books", {})[book_id] = state
         self._save(data)
 
+    def load_app_settings(self) -> dict[str, Any]:
+        data = self._load()
+        app = data.get("app", {})
+        if not isinstance(app, dict):
+            return {}
+        return dict(app)
+
+    def save_app_settings(self, settings: dict[str, Any]) -> None:
+        data = self._load()
+        data["app"] = dict(settings)
+        self._save(data)
+
+    def load_last_book_path(self) -> str | None:
+        settings = self.load_app_settings()
+        value = settings.get("last_book_path")
+        return value if isinstance(value, str) and value else None
+
+    def save_last_book_path(self, path: str) -> None:
+        settings = self.load_app_settings()
+        settings["last_book_path"] = path
+        self.save_app_settings(settings)
+
+    def book_ids(self) -> tuple[str, ...]:
+        books = self._load().get("books", {})
+        if not isinstance(books, dict):
+            return ()
+        return tuple(sorted(key for key in books.keys() if isinstance(key, str)))
+
+    def clear_book_state(self, book_id: str) -> None:
+        data = self._load()
+        books = data.setdefault("books", {})
+        books.pop(book_id, None)
+        self._save(data)
+
+    def clear_all(self) -> None:
+        self._save({"books": {}, "app": {}})
+
     def load_mapping(self, book_id: str) -> MappingConfig:
         state = self.get_book_state(book_id)
         mappings = state.get("mapping", {})
@@ -55,8 +92,16 @@ class ConfigStore:
             ebay_clearing_guid=mappings.get("ebay_clearing_guid"),
             ebay_income_guid=mappings.get("ebay_income_guid"),
             ebay_refunds_guid=mappings.get("ebay_refunds_guid"),
+            bank_suspense_guid=mappings.get("bank_suspense_guid"),
             etsy_fee_accounts=dict(mappings.get("etsy_fee_accounts", {})),
             ebay_fee_accounts=dict(mappings.get("ebay_fee_accounts", {})),
+            bank_match_overrides={
+                key: tuple(value)
+                for key, value in dict(mappings.get("bank_match_overrides", {})).items()
+                if isinstance(value, (list, tuple))
+            },
+            bank_merchant_accounts=dict(mappings.get("bank_merchant_accounts", {})),
+            bank_txn_account_overrides=dict(mappings.get("bank_txn_account_overrides", {})),
         )
 
     def save_mapping(self, book_id: str, mapping: MappingConfig) -> None:

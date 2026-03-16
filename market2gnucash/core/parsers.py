@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import re
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from market2gnucash.core.date_utils import parse_date
 from market2gnucash.core.decimal_utils import ZERO, parse_money, parse_money_required
 from market2gnucash.core.models import (
+    BankCsvProfile,
+    CsvPreviewData,
+    BankStatementData,
+    BankStatementRow,
     EbayInputData,
     EbayReportRow,
     EtsyInputData,
@@ -19,6 +25,7 @@ from market2gnucash.core.models import (
 
 _ORDER_RE = re.compile(r"Order\s*#(\d+)")
 _LISTING_RE = re.compile(r"Listing\s*#(\d+)")
+_OFX_DATE_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})")
 
 _EBAY_HEADER_PREFIX = "Transaction creation date,"
 _EBAY_NON_FEE_COLUMNS = {
@@ -55,6 +62,46 @@ _EBAY_NON_FEE_COLUMNS = {
     "Description",
 }
 
+_CSV_DATE_COLUMNS = (
+    "date",
+    "posting date",
+    "posted date",
+    "post date",
+    "transaction date",
+    "trans date",
+    "activity date",
+)
+_CSV_AMOUNT_COLUMNS = ("amount", "transaction amount", "amt", "value")
+_CSV_DEBIT_COLUMNS = ("debit", "withdrawal", "charge", "debits")
+_CSV_CREDIT_COLUMNS = ("credit", "deposit", "payment", "credits")
+_CSV_DESCRIPTION_COLUMNS = (
+    "description",
+    "transaction",
+    "details",
+    "payee",
+    "merchant",
+    "name",
+)
+_CSV_MEMO_COLUMNS = ("memo", "notes", "note", "category", "details")
+_CSV_ID_COLUMNS = ("fitid", "transaction id", "reference", "ref", "id")
+_CSV_CHECK_NUMBER_COLUMNS = ("check number", "checknum", "check #", "check")
+_CSV_CURRENCY_COLUMNS = ("currency", "curr")
+_CSV_ACCOUNT_ID_COLUMNS = ("account id", "account number", "acctid", "account #", "card number")
+_CSV_ACCOUNT_NAME_COLUMNS = ("account", "account name", "card name")
+_KNOWN_CSV_COLUMNS = (
+    _CSV_DATE_COLUMNS
+    + _CSV_AMOUNT_COLUMNS
+    + _CSV_DEBIT_COLUMNS
+    + _CSV_CREDIT_COLUMNS
+    + _CSV_DESCRIPTION_COLUMNS
+    + _CSV_MEMO_COLUMNS
+    + _CSV_ID_COLUMNS
+    + _CSV_CHECK_NUMBER_COLUMNS
+    + _CSV_CURRENCY_COLUMNS
+    + _CSV_ACCOUNT_ID_COLUMNS
+    + _CSV_ACCOUNT_NAME_COLUMNS
+)
+
 
 def _hash_row(parts: list[str]) -> str:
     payload = "\x1f".join(parts).encode("utf-8")
@@ -79,6 +126,614 @@ def _extract_listing_id(title: str, info: str) -> str | None:
     combined = f"{title} {info}"
     match = _LISTING_RE.search(combined)
     return match.group(1) if match else None
+
+
+def _read_text_with_fallback(path: Path) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode statement file {path}")
+
+
+def _parse_ofx_date(value: str) -> date:
+    text = value.strip()
+    match = _OFX_DATE_RE.match(text)
+    if not match:
+        raise ValueError(f"Unsupported OFX date format: {value!r}")
+    year, month, day = (int(part) for part in match.groups())
+    return date(year, month, day)
+
+
+def _find_first_present(raw: dict[str, str], candidates: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
+        if candidate in raw and raw[candidate]:
+            return raw[candidate]
+    return None
+
+
+def _normalize_csv_row(raw_row: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in raw_row.items():
+        if key is None:
+            continue
+        normalized[key.strip().lower()] = (value or "").strip()
+    return normalized
+
+
+def _csv_column_token(index: int) -> str:
+    return f"__col_{index}__"
+
+
+def _normalize_csv_header(value: str) -> str:
+    return value.strip().lower()
+
+
+def _decode_csv_column_token(token: str | None) -> int | None:
+    if not token or not token.startswith("__col_") or not token.endswith("__"):
+        return None
+    middle = token[len("__col_") : -len("__")]
+    try:
+        return int(middle)
+    except ValueError:
+        return None
+
+
+def _csv_profile_from_dict(raw_profile: object) -> BankCsvProfile | None:
+    if not isinstance(raw_profile, dict):
+        return None
+    return BankCsvProfile(
+        has_header=bool(raw_profile.get("has_header", True)),
+        date_column=raw_profile.get("date_column") if isinstance(raw_profile.get("date_column"), str) else None,
+        amount_column=raw_profile.get("amount_column") if isinstance(raw_profile.get("amount_column"), str) else None,
+        debit_column=raw_profile.get("debit_column") if isinstance(raw_profile.get("debit_column"), str) else None,
+        credit_column=raw_profile.get("credit_column") if isinstance(raw_profile.get("credit_column"), str) else None,
+        description_column=raw_profile.get("description_column") if isinstance(raw_profile.get("description_column"), str) else None,
+        memo_column=raw_profile.get("memo_column") if isinstance(raw_profile.get("memo_column"), str) else None,
+        id_column=raw_profile.get("id_column") if isinstance(raw_profile.get("id_column"), str) else None,
+        check_number_column=raw_profile.get("check_number_column") if isinstance(raw_profile.get("check_number_column"), str) else None,
+        currency_column=raw_profile.get("currency_column") if isinstance(raw_profile.get("currency_column"), str) else None,
+        account_id_column=raw_profile.get("account_id_column") if isinstance(raw_profile.get("account_id_column"), str) else None,
+        account_name_column=raw_profile.get("account_name_column") if isinstance(raw_profile.get("account_name_column"), str) else None,
+    )
+
+
+def bank_csv_profile_to_dict(profile: BankCsvProfile) -> dict[str, object]:
+    return {
+        "has_header": profile.has_header,
+        "date_column": profile.date_column,
+        "amount_column": profile.amount_column,
+        "debit_column": profile.debit_column,
+        "credit_column": profile.credit_column,
+        "description_column": profile.description_column,
+        "memo_column": profile.memo_column,
+        "id_column": profile.id_column,
+        "check_number_column": profile.check_number_column,
+        "currency_column": profile.currency_column,
+        "account_id_column": profile.account_id_column,
+        "account_name_column": profile.account_name_column,
+    }
+
+
+def _looks_like_headerless_card_csv(rows: list[list[str]]) -> bool:
+    if not rows:
+        return False
+    first = rows[0]
+    if len(first) < 3:
+        return False
+    try:
+        parse_date(first[0].strip().strip('"'))
+        parse_money_required(first[1].strip().strip('"'))
+    except Exception:
+        return False
+    return True
+
+
+def inspect_bank_csv_file(path: str | Path) -> CsvPreviewData:
+    csv_path = Path(path)
+    sample = _read_text_with_fallback(csv_path)
+    try:
+        dialect = csv.Sniffer().sniff(sample[:2048], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+
+    rows_data = list(csv.reader(io.StringIO(sample), dialect=dialect))
+    if not rows_data:
+        return CsvPreviewData(
+            path=str(csv_path),
+            delimiter=getattr(dialect, "delimiter", ","),
+            has_header=False,
+            columns=(),
+            sample_rows=(),
+        )
+
+    header_names = tuple(_normalize_csv_header(cell) for cell in rows_data[0])
+    has_known_header = any(name in _KNOWN_CSV_COLUMNS for name in header_names)
+    has_header = has_known_header and not _looks_like_headerless_card_csv(rows_data)
+    if has_header:
+        columns = header_names
+        sample_rows = tuple(tuple(cell.strip() for cell in row) for row in rows_data[1:6])
+    else:
+        columns = tuple(_csv_column_token(index) for index in range(len(rows_data[0])))
+        sample_rows = tuple(tuple(cell.strip() for cell in row) for row in rows_data[:5])
+
+    return CsvPreviewData(
+        path=str(csv_path),
+        delimiter=getattr(dialect, "delimiter", ","),
+        has_header=has_header,
+        columns=columns,
+        sample_rows=sample_rows,
+    )
+
+
+def suggest_bank_csv_profile(path: str | Path) -> BankCsvProfile:
+    preview = inspect_bank_csv_file(path)
+    columns = set(preview.columns)
+    if not preview.has_header:
+        return BankCsvProfile(
+            has_header=False,
+            date_column=_csv_column_token(0) if len(preview.columns) >= 1 else None,
+            amount_column=_csv_column_token(1) if len(preview.columns) >= 2 else None,
+            memo_column=_csv_column_token(3) if len(preview.columns) >= 4 else None,
+            description_column=_csv_column_token(4) if len(preview.columns) >= 5 else None,
+        )
+
+    def _pick(candidates: tuple[str, ...]) -> str | None:
+        for candidate in candidates:
+            if candidate in columns:
+                return candidate
+        return None
+
+    return BankCsvProfile(
+        has_header=True,
+        date_column=_pick(_CSV_DATE_COLUMNS),
+        amount_column=_pick(_CSV_AMOUNT_COLUMNS),
+        debit_column=_pick(_CSV_DEBIT_COLUMNS),
+        credit_column=_pick(_CSV_CREDIT_COLUMNS),
+        description_column=_pick(_CSV_DESCRIPTION_COLUMNS),
+        memo_column=_pick(_CSV_MEMO_COLUMNS),
+        id_column=_pick(_CSV_ID_COLUMNS),
+        check_number_column=_pick(_CSV_CHECK_NUMBER_COLUMNS),
+        currency_column=_pick(_CSV_CURRENCY_COLUMNS),
+        account_id_column=_pick(_CSV_ACCOUNT_ID_COLUMNS),
+        account_name_column=_pick(_CSV_ACCOUNT_NAME_COLUMNS),
+    )
+
+
+def _value_from_profile(raw: dict[str, str], column_name: str | None) -> str | None:
+    if not column_name:
+        return None
+    value = raw.get(column_name)
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _build_csv_row_map(
+    values: list[str],
+    columns: tuple[str, ...],
+) -> dict[str, str]:
+    raw: dict[str, str] = {}
+    for index, column in enumerate(columns):
+        raw[column] = values[index].strip() if index < len(values) else ""
+    return raw
+
+
+def _parse_profiled_bank_csv(
+    path: Path,
+    rows_data: list[list[str]],
+    start_date: date | None,
+    end_date: date | None,
+    profile: BankCsvProfile,
+) -> BankStatementData:
+    if not rows_data:
+        raise ValueError(f"CSV statement file {path} is empty")
+
+    if profile.has_header:
+        columns = tuple(_normalize_csv_header(cell) for cell in rows_data[0])
+        data_rows = rows_data[1:]
+    else:
+        columns = tuple(_csv_column_token(index) for index in range(len(rows_data[0])))
+        data_rows = rows_data
+
+    rows: list[BankStatementRow] = []
+    currency_values: set[str] = set()
+    account_id: str | None = None
+    account_name: str | None = None
+
+    for index, values in enumerate(data_rows, start=1):
+        cols = [(value or "").strip() for value in values]
+        if not any(cols):
+            continue
+        raw = _build_csv_row_map(cols, columns)
+
+        date_text = _value_from_profile(raw, profile.date_column)
+        if not date_text:
+            raise ValueError(f"CSV statement file {path} is missing a date value for row {index}")
+
+        row_date = parse_date(date_text)
+        if not _within_date_range(row_date, start_date, end_date):
+            continue
+
+        amount_text = _value_from_profile(raw, profile.amount_column)
+        if amount_text:
+            amount = parse_money_required(amount_text)
+        else:
+            debit = parse_money_required(_value_from_profile(raw, profile.debit_column))
+            credit = parse_money_required(_value_from_profile(raw, profile.credit_column))
+            amount = credit - debit
+
+        currency = _value_from_profile(raw, profile.currency_column)
+        if currency:
+            currency_values.add(currency)
+        if account_id is None:
+            account_id = _value_from_profile(raw, profile.account_id_column)
+        if account_name is None:
+            account_name = _value_from_profile(raw, profile.account_name_column)
+
+        description = _value_from_profile(raw, profile.description_column) or ""
+        memo = _value_from_profile(raw, profile.memo_column) or ""
+        fitid = _value_from_profile(raw, profile.id_column)
+        check_number = _value_from_profile(raw, profile.check_number_column)
+
+        row_id = _hash_row(
+            [
+                "bank_csv_profile",
+                str(path),
+                str(index),
+                date_text,
+                str(amount),
+                fitid or "",
+                description,
+            ]
+        )
+        rows.append(
+            BankStatementRow(
+                row_id=row_id,
+                row_number=index,
+                date=row_date,
+                amount=amount,
+                currency=currency,
+                description=description,
+                memo=memo,
+                fitid=fitid,
+                check_number=check_number,
+                transaction_type=None,
+                account_id=account_id,
+                account_name=account_name or path.stem,
+                source_path=str(path),
+                source_format="csv",
+                raw=raw,
+            )
+        )
+
+    return BankStatementData(
+        source_path=str(path),
+        source_format="csv",
+        account_id=account_id,
+        account_name=account_name or path.stem,
+        currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
+        rows=tuple(rows),
+    )
+
+
+def _parse_bank_csv(
+    path: Path,
+    start_date: date | None,
+    end_date: date | None,
+    csv_profile: BankCsvProfile | None = None,
+) -> BankStatementData:
+    sample = _read_text_with_fallback(path)
+    try:
+        dialect = csv.Sniffer().sniff(sample[:2048], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+
+    rows_data = list(csv.reader(io.StringIO(sample), dialect=dialect))
+    if not rows_data:
+        raise ValueError(f"CSV statement file {path} is empty")
+
+    if csv_profile is not None:
+        return _parse_profiled_bank_csv(path, rows_data, start_date, end_date, csv_profile)
+
+    header_names = [cell.strip().lower() for cell in rows_data[0]]
+    has_known_header = any(name in _KNOWN_CSV_COLUMNS for name in header_names)
+    if not has_known_header and _looks_like_headerless_card_csv(rows_data):
+        return _parse_profiled_bank_csv(
+            path,
+            rows_data,
+            start_date,
+            end_date,
+            BankCsvProfile(
+                has_header=False,
+                date_column=_csv_column_token(0),
+                amount_column=_csv_column_token(1),
+                memo_column=_csv_column_token(3),
+                description_column=_csv_column_token(4),
+            ),
+        )
+
+    rows: list[BankStatementRow] = []
+    currency_values: set[str] = set()
+    account_id: str | None = None
+    account_name: str | None = None
+
+    reader = csv.DictReader(io.StringIO(sample), dialect=dialect)
+    if reader.fieldnames is None:
+        raise ValueError(f"CSV statement file {path} has no header row")
+
+    for index, raw_row in enumerate(reader, start=1):
+        raw = _normalize_csv_row(raw_row)
+        date_text = _find_first_present(raw, _CSV_DATE_COLUMNS)
+        if not date_text:
+            raise ValueError(f"CSV statement file {path} is missing a recognizable date column")
+        row_date = parse_date(date_text)
+        if not _within_date_range(row_date, start_date, end_date):
+            continue
+
+        amount_text = _find_first_present(raw, _CSV_AMOUNT_COLUMNS)
+        if amount_text:
+            amount = parse_money_required(amount_text)
+        else:
+            debit = parse_money_required(_find_first_present(raw, _CSV_DEBIT_COLUMNS))
+            credit = parse_money_required(_find_first_present(raw, _CSV_CREDIT_COLUMNS))
+            amount = credit - debit
+
+        currency = _find_first_present(raw, _CSV_CURRENCY_COLUMNS)
+        if currency:
+            currency_values.add(currency)
+        if account_id is None:
+            account_id = _find_first_present(raw, _CSV_ACCOUNT_ID_COLUMNS)
+        if account_name is None:
+            account_name = _find_first_present(raw, _CSV_ACCOUNT_NAME_COLUMNS)
+
+        description = _find_first_present(raw, _CSV_DESCRIPTION_COLUMNS) or ""
+        memo = _find_first_present(raw, _CSV_MEMO_COLUMNS) or ""
+        fitid = _find_first_present(raw, _CSV_ID_COLUMNS)
+        check_number = _find_first_present(raw, _CSV_CHECK_NUMBER_COLUMNS)
+
+        row_id = _hash_row(
+            [
+                "bank_csv",
+                str(path),
+                str(index),
+                date_text,
+                str(amount),
+                fitid or "",
+                description,
+            ]
+        )
+        rows.append(
+            BankStatementRow(
+                row_id=row_id,
+                row_number=index,
+                date=row_date,
+                amount=amount,
+                currency=currency,
+                description=description,
+                memo=memo,
+                fitid=fitid,
+                check_number=check_number,
+                transaction_type=None,
+                account_id=account_id,
+                account_name=account_name or path.stem,
+                source_path=str(path),
+                source_format="csv",
+                raw=raw,
+            )
+        )
+
+    return BankStatementData(
+        source_path=str(path),
+        source_format="csv",
+        account_id=account_id,
+        account_name=account_name or path.stem,
+        currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
+        rows=tuple(rows),
+    )
+
+
+def _ofx_text_value(block: str, tag_name: str) -> str | None:
+    match = re.search(rf"<{tag_name}>([^<\r\n]+)", block, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _xml_local_name(tag: str) -> str:
+    if tag.startswith("{"):
+        return tag.split("}", 1)[1].lower()
+    return tag.lower()
+
+
+def _xml_child_text(element: ET.Element, tag_name: str) -> str | None:
+    for child in element.iter():
+        if _xml_local_name(child.tag) == tag_name.lower():
+            value = (child.text or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _parse_bank_ofx(
+    path: Path,
+    start_date: date | None,
+    end_date: date | None,
+) -> BankStatementData:
+    text = _read_text_with_fallback(path)
+    ofx_start = text.upper().find("<OFX")
+    if ofx_start == -1:
+        raise ValueError(f"OFX statement file {path} does not contain an <OFX> payload")
+    payload = text[ofx_start:]
+
+    account_id = None
+    account_name = path.stem
+    currency = None
+    rows: list[BankStatementRow] = []
+
+    try:
+        xml_root = ET.fromstring(payload)
+        currency = _xml_child_text(xml_root, "CURDEF")
+        account_id = _xml_child_text(xml_root, "ACCTID")
+
+        transactions = [element for element in xml_root.iter() if _xml_local_name(element.tag) == "stmttrn"]
+        for index, transaction in enumerate(transactions, start=1):
+            posted = _xml_child_text(transaction, "DTPOSTED")
+            amount_text = _xml_child_text(transaction, "TRNAMT")
+            if not posted or not amount_text:
+                continue
+
+            row_date = _parse_ofx_date(posted)
+            if not _within_date_range(row_date, start_date, end_date):
+                continue
+
+            fitid = _xml_child_text(transaction, "FITID")
+            description = _xml_child_text(transaction, "NAME") or ""
+            memo = _xml_child_text(transaction, "MEMO") or ""
+            trntype = _xml_child_text(transaction, "TRNTYPE")
+            check_number = _xml_child_text(transaction, "CHECKNUM")
+            amount = parse_money_required(amount_text)
+
+            row_id = _hash_row(
+                [
+                    "bank_ofx",
+                    str(path),
+                    str(index),
+                    posted,
+                    str(amount),
+                    fitid or "",
+                    description,
+                ]
+            )
+            rows.append(
+                BankStatementRow(
+                    row_id=row_id,
+                    row_number=index,
+                    date=row_date,
+                    amount=amount,
+                    currency=currency,
+                    description=description,
+                    memo=memo,
+                    fitid=fitid,
+                    check_number=check_number,
+                    transaction_type=trntype,
+                    account_id=account_id,
+                    account_name=account_name,
+                    source_path=str(path),
+                    source_format="ofx",
+                    raw={
+                        "dtposted": posted,
+                        "trnamt": amount_text,
+                        "fitid": fitid or "",
+                        "name": description,
+                        "memo": memo,
+                        "trntype": trntype or "",
+                        "checknum": check_number or "",
+                    },
+                )
+            )
+    except ET.ParseError:
+        currency = _ofx_text_value(payload, "CURDEF")
+        account_id = _ofx_text_value(payload, "ACCTID")
+        blocks = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", payload, flags=re.IGNORECASE | re.DOTALL)
+        for index, block in enumerate(blocks, start=1):
+            posted = _ofx_text_value(block, "DTPOSTED")
+            amount_text = _ofx_text_value(block, "TRNAMT")
+            if not posted or not amount_text:
+                continue
+
+            row_date = _parse_ofx_date(posted)
+            if not _within_date_range(row_date, start_date, end_date):
+                continue
+
+            fitid = _ofx_text_value(block, "FITID")
+            description = _ofx_text_value(block, "NAME") or ""
+            memo = _ofx_text_value(block, "MEMO") or ""
+            trntype = _ofx_text_value(block, "TRNTYPE")
+            check_number = _ofx_text_value(block, "CHECKNUM")
+            amount = parse_money_required(amount_text)
+
+            row_id = _hash_row(
+                [
+                    "bank_ofx",
+                    str(path),
+                    str(index),
+                    posted,
+                    str(amount),
+                    fitid or "",
+                    description,
+                ]
+            )
+            rows.append(
+                BankStatementRow(
+                    row_id=row_id,
+                    row_number=index,
+                    date=row_date,
+                    amount=amount,
+                    currency=currency,
+                    description=description,
+                    memo=memo,
+                    fitid=fitid,
+                    check_number=check_number,
+                    transaction_type=trntype,
+                    account_id=account_id,
+                    account_name=account_name,
+                    source_path=str(path),
+                    source_format="ofx",
+                    raw={
+                        "dtposted": posted,
+                        "trnamt": amount_text,
+                        "fitid": fitid or "",
+                        "name": description,
+                        "memo": memo,
+                        "trntype": trntype or "",
+                        "checknum": check_number or "",
+                    },
+                )
+            )
+
+    return BankStatementData(
+        source_path=str(path),
+        source_format="ofx",
+        account_id=account_id,
+        account_name=account_name,
+        currency=currency,
+        rows=tuple(rows),
+    )
+
+
+def parse_bank_statement_file(
+    path: str | Path,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    csv_profile: BankCsvProfile | dict[str, object] | None = None,
+) -> BankStatementData:
+    statement_path = Path(path)
+    suffix = statement_path.suffix.lower()
+    normalized_profile = (
+        csv_profile
+        if isinstance(csv_profile, BankCsvProfile)
+        else _csv_profile_from_dict(csv_profile)
+    )
+    if suffix in {".ofx", ".qfx"}:
+        return _parse_bank_ofx(statement_path, start_date, end_date)
+    if suffix == ".csv":
+        return _parse_bank_csv(statement_path, start_date, end_date, normalized_profile)
+    raise ValueError(f"Unsupported bank/card statement format for {statement_path}")
+
+
+def parse_bank_statement_files(
+    paths: list[str] | tuple[str, ...],
+    start_date: date | None = None,
+    end_date: date | None = None,
+    csv_profiles: dict[str, BankCsvProfile | dict[str, object]] | None = None,
+) -> tuple[BankStatementData, ...]:
+    parsed_files: list[BankStatementData] = []
+    for path in paths:
+        parsed_files.append(parse_bank_statement_file(path, start_date, end_date, (csv_profiles or {}).get(path)))
+    return tuple(parsed_files)
 
 
 def parse_etsy_statement(

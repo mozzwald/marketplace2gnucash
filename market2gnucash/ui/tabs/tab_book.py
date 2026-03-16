@@ -76,16 +76,31 @@ class BookTab(QWidget):
         if not file_path:
             return
 
+        self.load_book(file_path)
+
+    def load_book(
+        self,
+        file_path: str | Path,
+        *,
+        show_errors: bool = True,
+        show_locked_warning: bool = True,
+        allow_locked: bool = True,
+    ) -> bool:
         path = Path(file_path)
         if not path.exists():
-            QMessageBox.critical(self, "Error", "Selected file does not exist.")
-            return
+            if show_errors:
+                QMessageBox.critical(self, "Error", "Selected file does not exist.")
+            return False
 
         try:
             book_info = load_book_info(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to load book metadata:\n{exc}")
-            return
+            if show_errors:
+                QMessageBox.critical(self, "Error", f"Failed to load book metadata:\n{exc}")
+            return False
+
+        if book_info.lock_files and not allow_locked:
+            return False
 
         self.app_state["book_path"] = book_info.path
         self.app_state["book_id"] = book_info.book_id
@@ -97,12 +112,14 @@ class BookTab(QWidget):
         self.app_state["mapping_config"] = config_store.load_mapping(book_info.book_id)
         self.app_state["inputs"] = config_store.load_inputs(book_info.book_id)
         self.app_state["plan_result"] = None
+        config_store.save_last_book_path(book_info.path)
 
         self.app_state["notify_state_changed"]()
 
-        if book_info.lock_files:
+        if book_info.lock_files and show_locked_warning:
             QMessageBox.warning(
                 self,
                 "Book Locked",
                 "This book appears to be locked/open. Imports are blocked until lock files are gone.",
             )
+        return True

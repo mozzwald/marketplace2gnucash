@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -60,37 +62,31 @@ class InputsTab(QWidget):
 
         layout.addWidget(self._separator())
 
-        marketplace_group = QGroupBox("Marketplace")
+        marketplace_group = QGroupBox("Marketplace Accounts")
         marketplace_layout = QVBoxLayout(marketplace_group)
 
-        self.etsy_statement_label = QLabel("(none)")
-        self.etsy_soldorders_label = QLabel("(none)")
-        self.ebay_label = QLabel("(none)")
+        marketplace_tools = QHBoxLayout()
+        add_etsy_button = QPushButton("Add Etsy Account")
+        add_etsy_button.clicked.connect(lambda: self._add_marketplace_import("etsy"))
+        add_ebay_button = QPushButton("Add eBay Account")
+        add_ebay_button.clicked.connect(lambda: self._add_marketplace_import("ebay"))
+        marketplace_tools.addWidget(add_etsy_button)
+        marketplace_tools.addWidget(add_ebay_button)
+        marketplace_tools.addStretch()
+        marketplace_layout.addLayout(marketplace_tools)
 
-        marketplace_layout.addLayout(
-            self._file_row(
-                "Select Etsy Statement...",
-                self.etsy_statement_label,
-                "etsy_statement_path",
-                "CSV Files (*.csv)",
-            )
+        self.marketplace_imports_table = QTableWidget()
+        self.marketplace_imports_table.setColumnCount(4)
+        self.marketplace_imports_table.setHorizontalHeaderLabels(
+            ["Marketplace", "Account Name", "Files", "Actions"]
         )
-        marketplace_layout.addLayout(
-            self._file_row(
-                "Select Etsy SoldOrders...",
-                self.etsy_soldorders_label,
-                "etsy_sold_orders_path",
-                "CSV Files (*.csv)",
-            )
+        self.marketplace_imports_table.verticalHeader().setVisible(False)
+        marketplace_layout.addWidget(self.marketplace_imports_table)
+
+        self.marketplace_hint_label = QLabel(
+            "Create one import bundle per Etsy or eBay seller account. Etsy requires Statement and Sold Orders; eBay requires Transaction Report."
         )
-        marketplace_layout.addLayout(
-            self._file_row(
-                "Select eBay Report...",
-                self.ebay_label,
-                "ebay_report_path",
-                "CSV Files (*.csv)",
-            )
-        )
+        marketplace_layout.addWidget(self.marketplace_hint_label)
         layout.addWidget(marketplace_group)
 
         layout.addWidget(self._separator())
@@ -122,10 +118,6 @@ class InputsTab(QWidget):
     def refresh_from_state(self) -> None:
         inputs = self.app_state.get("inputs", {})
 
-        self.etsy_statement_label.setText(inputs.get("etsy_statement_path") or "(none)")
-        self.etsy_soldorders_label.setText(inputs.get("etsy_sold_orders_path") or "(none)")
-        self.ebay_label.setText(inputs.get("ebay_report_path") or "(none)")
-
         use_range = bool(inputs.get("use_date_range", False))
         self.use_range_checkbox.setChecked(use_range)
 
@@ -142,24 +134,8 @@ class InputsTab(QWidget):
         self.start_date_edit.setEnabled(use_range)
         self.end_date_edit.setEnabled(use_range)
 
+        self._populate_marketplace_imports_table()
         self._populate_bank_imports_table()
-
-    def _file_row(
-        self,
-        button_text: str,
-        label: QLabel,
-        key: str,
-        file_filter: str,
-    ) -> QHBoxLayout:
-        row = QHBoxLayout()
-
-        button = QPushButton(button_text)
-        button.clicked.connect(lambda: self._select_file(label, key, file_filter))
-
-        row.addWidget(button)
-        row.addWidget(label)
-
-        return row
 
     def _separator(self) -> QFrame:
         line = QFrame()
@@ -167,16 +143,155 @@ class InputsTab(QWidget):
         line.setFrameShadow(QFrame.Sunken)
         return line
 
-    def _select_file(self, label: QLabel, key: str, file_filter: str) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", file_filter)
-        if not file_path:
-            return
+    def _marketplace_imports(self) -> list[dict[str, object]]:
+        inputs = self.app_state.get("inputs", {})
+        imports = inputs.get("marketplace_imports", [])
+        normalized: list[dict[str, object]] = []
+        for item in imports:
+            if not isinstance(item, dict):
+                continue
+            marketplace = item.get("marketplace") if isinstance(item.get("marketplace"), str) else None
+            account_key = item.get("account_key") if isinstance(item.get("account_key"), str) else None
+            import_id = item.get("import_id") if isinstance(item.get("import_id"), str) else None
+            account_label = item.get("account_label") if isinstance(item.get("account_label"), str) else ""
+            if not marketplace or marketplace not in {"etsy", "ebay"} or not account_key or not import_id:
+                continue
+            normalized.append(
+                {
+                    "import_id": import_id,
+                    "marketplace": marketplace,
+                    "account_key": account_key,
+                    "account_label": account_label,
+                    "etsy_statement_path": item.get("etsy_statement_path") if isinstance(item.get("etsy_statement_path"), str) else None,
+                    "etsy_sold_orders_path": item.get("etsy_sold_orders_path") if isinstance(item.get("etsy_sold_orders_path"), str) else None,
+                    "ebay_report_path": item.get("ebay_report_path") if isinstance(item.get("ebay_report_path"), str) else None,
+                }
+            )
+        return normalized
 
-        label.setText(file_path)
+    def _set_marketplace_imports(self, imports: list[dict[str, object]]) -> None:
         inputs = dict(self.app_state.get("inputs", {}))
-        inputs[key] = file_path
+        inputs["marketplace_imports"] = imports
         self.app_state["inputs"] = inputs
         self._persist_inputs()
+
+    def _add_marketplace_import(self, marketplace: str) -> None:
+        marketplace_imports = self._marketplace_imports()
+        marketplace_imports.append(
+            {
+                "import_id": uuid4().hex,
+                "marketplace": marketplace,
+                "account_key": f"{marketplace}:{uuid4().hex[:8]}",
+                "account_label": f"{'Etsy' if marketplace == 'etsy' else 'eBay'} Account {len(marketplace_imports) + 1}",
+                "etsy_statement_path": None,
+                "etsy_sold_orders_path": None,
+                "ebay_report_path": None,
+            }
+        )
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _populate_marketplace_imports_table(self) -> None:
+        marketplace_imports = self._marketplace_imports()
+        self.marketplace_imports_table.setRowCount(len(marketplace_imports))
+        for row_index, marketplace_import in enumerate(marketplace_imports):
+            marketplace = str(marketplace_import["marketplace"])
+            title = "Etsy" if marketplace == "etsy" else "eBay"
+            self.marketplace_imports_table.setItem(row_index, 0, QTableWidgetItem(title))
+
+            name_edit = QLineEdit(str(marketplace_import.get("account_label") or ""))
+            name_edit.editingFinished.connect(
+                lambda idx=row_index, widget=name_edit: self._rename_marketplace_import(idx, widget.text())
+            )
+            self.marketplace_imports_table.setCellWidget(row_index, 1, name_edit)
+
+            if marketplace == "etsy":
+                file_parts = [
+                    f"Statement: {Path(path).name}" if path else "Statement: (none)"
+                    for path in [marketplace_import.get("etsy_statement_path")]
+                ]
+                file_parts.extend(
+                    f"Sold Orders: {Path(path).name}" if path else "Sold Orders: (none)"
+                    for path in [marketplace_import.get("etsy_sold_orders_path")]
+                )
+            else:
+                report_path = marketplace_import.get("ebay_report_path")
+                file_parts = [f"Report: {Path(report_path).name}" if report_path else "Report: (none)"]
+            self.marketplace_imports_table.setItem(row_index, 2, QTableWidgetItem("\n".join(file_parts)))
+
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            if marketplace == "etsy":
+                statement_button = QPushButton("Statement CSV")
+                statement_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "etsy_statement_path", "Select Etsy Statement CSV")
+                )
+                sold_orders_button = QPushButton("Sold Orders CSV")
+                sold_orders_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "etsy_sold_orders_path", "Select Etsy Sold Orders CSV")
+                )
+                actions_layout.addWidget(statement_button)
+                actions_layout.addWidget(sold_orders_button)
+            else:
+                report_button = QPushButton("Report CSV")
+                report_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "ebay_report_path", "Select eBay Transaction Report CSV")
+                )
+                actions_layout.addWidget(report_button)
+
+            clear_files_button = QPushButton("Clear Files")
+            clear_files_button.clicked.connect(
+                lambda _checked=False, idx=row_index: self._clear_marketplace_files(idx)
+            )
+            remove_button = QPushButton("Remove")
+            remove_button.clicked.connect(
+                lambda _checked=False, idx=row_index: self._remove_marketplace_import(idx)
+            )
+            actions_layout.addWidget(clear_files_button)
+            actions_layout.addWidget(remove_button)
+            actions_layout.addStretch()
+            self.marketplace_imports_table.setCellWidget(row_index, 3, actions_widget)
+
+        self.marketplace_imports_table.resizeColumnsToContents()
+
+    def _rename_marketplace_import(self, row_index: int, account_label: str) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        trimmed = account_label.strip()
+        if not trimmed:
+            return
+        marketplace_imports[row_index]["account_label"] = trimmed
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _select_marketplace_file(self, row_index: int, field_name: str, title: str) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        file_path, _ = QFileDialog.getOpenFileName(self, title, "", "CSV Files (*.csv)")
+        if not file_path:
+            return
+        marketplace_imports[row_index][field_name] = file_path
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _clear_marketplace_files(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        marketplace = marketplace_imports[row_index]["marketplace"]
+        if marketplace == "etsy":
+            marketplace_imports[row_index]["etsy_statement_path"] = None
+            marketplace_imports[row_index]["etsy_sold_orders_path"] = None
+        else:
+            marketplace_imports[row_index]["ebay_report_path"] = None
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _remove_marketplace_import(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        del marketplace_imports[row_index]
+        self._set_marketplace_imports(marketplace_imports)
 
     def _bank_imports(self) -> list[dict[str, object]]:
         inputs = self.app_state.get("inputs", {})

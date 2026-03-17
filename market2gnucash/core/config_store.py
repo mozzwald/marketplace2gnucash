@@ -5,7 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from market2gnucash.core.models import MappingConfig
+from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping
 from market2gnucash.core.paths import config_json_path
 
 
@@ -85,16 +85,23 @@ class ConfigStore:
         mappings = state.get("mapping", {})
         if not isinstance(mappings, dict):
             mappings = {}
+        marketplace_accounts: dict[str, MarketplaceAccountMapping] = {}
+        raw_marketplace_accounts = mappings.get("marketplace_accounts", {})
+        if isinstance(raw_marketplace_accounts, dict):
+            for account_key, raw_value in raw_marketplace_accounts.items():
+                if not isinstance(account_key, str) or not isinstance(raw_value, dict):
+                    continue
+                fee_accounts = raw_value.get("fee_accounts", {})
+                marketplace_accounts[account_key] = MarketplaceAccountMapping(
+                    marketplace=raw_value.get("marketplace") if isinstance(raw_value.get("marketplace"), str) else "",
+                    account_label=raw_value.get("account_label") if isinstance(raw_value.get("account_label"), str) else account_key,
+                    clearing_guid=raw_value.get("clearing_guid") if isinstance(raw_value.get("clearing_guid"), str) else None,
+                    income_guid=raw_value.get("income_guid") if isinstance(raw_value.get("income_guid"), str) else None,
+                    refunds_guid=raw_value.get("refunds_guid") if isinstance(raw_value.get("refunds_guid"), str) else None,
+                    fee_accounts=dict(fee_accounts) if isinstance(fee_accounts, dict) else {},
+                )
         return MappingConfig(
-            etsy_clearing_guid=mappings.get("etsy_clearing_guid"),
-            etsy_income_guid=mappings.get("etsy_income_guid"),
-            etsy_refunds_guid=mappings.get("etsy_refunds_guid"),
-            ebay_clearing_guid=mappings.get("ebay_clearing_guid"),
-            ebay_income_guid=mappings.get("ebay_income_guid"),
-            ebay_refunds_guid=mappings.get("ebay_refunds_guid"),
-            bank_suspense_guid=mappings.get("bank_suspense_guid"),
-            etsy_fee_accounts=dict(mappings.get("etsy_fee_accounts", {})),
-            ebay_fee_accounts=dict(mappings.get("ebay_fee_accounts", {})),
+            marketplace_accounts=marketplace_accounts,
             bank_match_overrides={
                 key: tuple(value)
                 for key, value in dict(mappings.get("bank_match_overrides", {})).items()

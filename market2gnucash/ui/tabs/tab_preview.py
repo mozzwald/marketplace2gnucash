@@ -31,9 +31,9 @@ class PreviewTab(QWidget):
         self.status_label = QLabel("No preview generated.")
 
         self.txn_table = QTableWidget()
-        self.txn_table.setColumnCount(7)
+        self.txn_table.setColumnCount(8)
         self.txn_table.setHorizontalHeaderLabels(
-            ["Date", "Market", "Kind", "ID", "Net", "Status", "Reason"]
+            ["Date", "Market", "Market Acct", "Kind", "ID", "Net", "Status", "Reason"]
         )
         self.txn_table.verticalHeader().setVisible(False)
         self.txn_table.setSortingEnabled(True)
@@ -77,15 +77,14 @@ class PreviewTab(QWidget):
         start_date = date.fromisoformat(inputs["start_date"]) if use_range and inputs.get("start_date") else None
         end_date = date.fromisoformat(inputs["end_date"]) if use_range and inputs.get("end_date") else None
         bank_imports = inputs.get("bank_imports", [])
+        marketplace_imports = inputs.get("marketplace_imports", [])
 
         try:
             plan = build_plan(
                 book_id=book_id,
                 dedupe_store=self.app_state["dedupe_store"],
                 mapping=self.app_state["mapping_config"],
-                etsy_statement_path=inputs.get("etsy_statement_path"),
-                etsy_sold_orders_path=inputs.get("etsy_sold_orders_path"),
-                ebay_report_path=inputs.get("ebay_report_path"),
+                marketplace_imports=marketplace_imports,
                 bank_imports=bank_imports,
                 start_date=start_date,
                 end_date=end_date,
@@ -95,8 +94,7 @@ class PreviewTab(QWidget):
             return
 
         self.app_state["plan_result"] = plan
-        self.app_state["etsy_mapping_keys"] = plan.etsy_mapping_keys
-        self.app_state["ebay_fee_columns"] = plan.ebay_fee_columns
+        self.app_state["marketplace_mapping_keys"] = dict(plan.marketplace_mapping_keys)
         self.app_state["notify_state_changed"]()
 
     def _load_plan(self, plan: PlanResult) -> None:
@@ -115,6 +113,7 @@ class PreviewTab(QWidget):
             values = [
                 txn.date.isoformat(),
                 txn.marketplace,
+                txn.marketplace_account_label or "",
                 txn.txn_kind,
                 txn.txn_id,
                 str(txn.clearing_amount),

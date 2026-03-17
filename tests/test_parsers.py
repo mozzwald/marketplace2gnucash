@@ -16,13 +16,14 @@ from market2gnucash.core.models import BankCsvProfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"
+RS_SAMPLES = SAMPLES / "RS"
 
 
 class ParserTests(unittest.TestCase):
     def test_parse_etsy_statement_and_sold_orders(self) -> None:
         etsy_data = parse_etsy_inputs(
-            SAMPLES / "etsy_statement_2026_2.csv",
-            SAMPLES / "EtsySoldOrders2026-2.csv",
+            RS_SAMPLES / "etsy_statement_2026_2.csv",
+            RS_SAMPLES / "EtsySoldOrders2026-2.csv",
         )
 
         self.assertGreater(len(etsy_data.statement_rows), 0)
@@ -48,7 +49,7 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(all(isinstance(row.net_amount, Decimal) for row in order_rows))
 
     def test_parse_etsy_statement_extracts_listing_ids(self) -> None:
-        rows = parse_etsy_statement(SAMPLES / "etsy_statement_2026_2.csv")
+        rows = parse_etsy_statement(RS_SAMPLES / "etsy_statement_2026_2.csv")
         listing_rows = [row for row in rows if row.title == "Listing fee"]
         self.assertGreater(len(listing_rows), 0)
         self.assertTrue(all(row.listing_id for row in listing_rows))

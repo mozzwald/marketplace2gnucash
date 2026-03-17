@@ -103,8 +103,7 @@ class SettingsTab(QWidget):
         self.app_state["mapping_config"] = MappingConfig()
         self.app_state["inputs"] = {}
         self.app_state["plan_result"] = None
-        self.app_state["etsy_mapping_keys"] = ()
-        self.app_state["ebay_fee_columns"] = ()
+        self.app_state["marketplace_mapping_keys"] = {}
 
     def _confirm(self, title: str, text: str) -> bool:
         result = QMessageBox.question(self, title, text)

@@ -29,6 +29,8 @@ class GnuCashWriterIntegrationTests(unittest.TestCase):
             planned = PlannedTransaction(
                 dedupe_key="integration:test:1",
                 marketplace="test",
+                marketplace_account_key=None,
+                marketplace_account_label=None,
                 txn_kind="sale",
                 txn_id="1",
                 date=date(2026, 2, 22),

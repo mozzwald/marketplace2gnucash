@@ -138,6 +138,17 @@ class BankImportSpec:
 
 
 @dataclass(frozen=True)
+class MarketplaceImportSpec:
+    import_id: str
+    marketplace: str
+    account_key: str
+    account_label: str
+    etsy_statement_path: str | None = None
+    etsy_sold_orders_path: str | None = None
+    ebay_report_path: str | None = None
+
+
+@dataclass(frozen=True)
 class CsvPreviewData:
     path: str
     delimiter: str
@@ -148,18 +159,20 @@ class CsvPreviewData:
 
 @dataclass(frozen=True)
 class MappingConfig:
-    etsy_clearing_guid: str | None = None
-    etsy_income_guid: str | None = None
-    etsy_refunds_guid: str | None = None
-    ebay_clearing_guid: str | None = None
-    ebay_income_guid: str | None = None
-    ebay_refunds_guid: str | None = None
-    bank_suspense_guid: str | None = None
-    etsy_fee_accounts: Mapping[str, str] = field(default_factory=dict)
-    ebay_fee_accounts: Mapping[str, str] = field(default_factory=dict)
+    marketplace_accounts: Mapping[str, "MarketplaceAccountMapping"] = field(default_factory=dict)
     bank_match_overrides: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     bank_merchant_accounts: Mapping[str, str] = field(default_factory=dict)
     bank_txn_account_overrides: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MarketplaceAccountMapping:
+    marketplace: str
+    account_label: str
+    clearing_guid: str | None = None
+    income_guid: str | None = None
+    refunds_guid: str | None = None
+    fee_accounts: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -174,6 +187,8 @@ class PlannedSplit:
 class PlannedTransaction:
     dedupe_key: str
     marketplace: str
+    marketplace_account_key: str | None
+    marketplace_account_label: str | None
     txn_kind: str
     txn_id: str
     date: date
@@ -197,6 +212,9 @@ class BankMatchTarget:
     account_guid: str
     amount: Decimal
     memo: str
+    marketplace: str
+    marketplace_account_key: str | None
+    marketplace_account_label: str | None
 
 
 @dataclass(frozen=True)
@@ -210,6 +228,7 @@ class BankMatchResult:
     match_source: str
     matched_transaction_ids: tuple[str, ...]
     targets: tuple[BankMatchTarget, ...]
+    marketplace_account_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -228,7 +247,6 @@ class BankCategoryResult:
 class PlanResult:
     transactions: tuple[PlannedTransactionStatus, ...]
     warnings: tuple[str, ...]
-    etsy_mapping_keys: tuple[str, ...]
-    ebay_fee_columns: tuple[str, ...]
+    marketplace_mapping_keys: Mapping[str, tuple[str, ...]]
     bank_match_results: tuple[BankMatchResult, ...]
     bank_category_results: tuple[BankCategoryResult, ...]

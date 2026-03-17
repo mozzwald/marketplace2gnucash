@@ -112,6 +112,7 @@ class BookTab(QWidget):
         self.app_state["mapping_config"] = config_store.load_mapping(book_info.book_id)
         self.app_state["inputs"] = config_store.load_inputs(book_info.book_id)
         self.app_state["plan_result"] = None
+        self.app_state["marketplace_mapping_keys"] = {}
         config_store.save_last_book_path(book_info.path)
 
         self.app_state["notify_state_changed"]()

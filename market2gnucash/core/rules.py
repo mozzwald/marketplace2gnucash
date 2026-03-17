@@ -18,6 +18,7 @@ from market2gnucash.core.models import (
     EtsyInputData,
     EtsyStatementRow,
     MappingConfig,
+    MarketplaceAccountMapping,
     PlannedSplit,
     PlannedTransaction,
 )
@@ -102,6 +103,8 @@ def _finalize_transaction(
     *,
     dedupe_key: str,
     marketplace: str,
+    marketplace_account_key: str | None,
+    marketplace_account_label: str | None,
     txn_kind: str,
     txn_id: str,
     txn_date: date,
@@ -118,6 +121,8 @@ def _finalize_transaction(
     return PlannedTransaction(
         dedupe_key=dedupe_key,
         marketplace=marketplace,
+        marketplace_account_key=marketplace_account_key,
+        marketplace_account_label=marketplace_account_label,
         txn_kind=txn_kind,
         txn_id=txn_id,
         date=txn_date,
@@ -156,9 +161,25 @@ def _is_etsy_sale_related(row: EtsyStatementRow) -> bool:
     return True
 
 
-def _lookup_etsy_fee_account(mapping: MappingConfig, row: EtsyStatementRow) -> tuple[str | None, str | None]:
+def marketplace_mapping(
+    mapping: MappingConfig,
+    *,
+    account_key: str,
+    marketplace: str,
+    account_label: str,
+) -> MarketplaceAccountMapping:
+    configured = mapping.marketplace_accounts.get(account_key)
+    if configured is not None:
+        return configured
+    return MarketplaceAccountMapping(marketplace=marketplace, account_label=account_label)
+
+
+def _lookup_etsy_fee_account_for_marketplace(
+    account_mapping: MarketplaceAccountMapping,
+    row: EtsyStatementRow,
+) -> tuple[str | None, str | None]:
     for key in etsy_mapping_key_candidates(row):
-        account_guid = mapping.etsy_fee_accounts.get(key)
+        account_guid = account_mapping.fee_accounts.get(key)
         if account_guid:
             return key, account_guid
     return None, None
@@ -167,9 +188,18 @@ def _lookup_etsy_fee_account(mapping: MappingConfig, row: EtsyStatementRow) -> t
 def build_etsy_transactions(
     data: EtsyInputData,
     mapping: MappingConfig,
+    *,
+    account_key: str,
+    account_label: str,
 ) -> tuple[tuple[PlannedTransaction, ...], tuple[str, ...], tuple[str, ...]]:
     transactions: list[PlannedTransaction] = []
     warnings: list[str] = []
+    account_mapping = marketplace_mapping(
+        mapping,
+        account_key=account_key,
+        marketplace="etsy",
+        account_label=account_label,
+    )
 
     statement_rows = data.statement_rows
     sold_by_order = {row.order_id: row for row in data.sold_orders}
@@ -212,10 +242,10 @@ def build_etsy_transactions(
         income_base = sold.order_total - statement_tax
 
         splits: list[PlannedSplit] = []
-        if mapping.etsy_clearing_guid:
+        if account_mapping.clearing_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.etsy_clearing_guid,
+                    account_guid=account_mapping.clearing_guid,
                     amount=clearing_amount,
                     memo=f"Order #{order_id} net proceeds",
                 )
@@ -230,10 +260,10 @@ def build_etsy_transactions(
                 )
             )
 
-        if mapping.etsy_income_guid:
+        if account_mapping.income_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.etsy_income_guid,
+                    account_guid=account_mapping.income_guid,
                     amount=-income_base,
                     memo=f"Order #{order_id} income base",
                 )
@@ -249,7 +279,7 @@ def build_etsy_transactions(
             )
 
         for row in fee_rows:
-            key, account_guid = _lookup_etsy_fee_account(mapping, row)
+            key, account_guid = _lookup_etsy_fee_account_for_marketplace(account_mapping, row)
             fee_amount = -(row.net or ZERO)
             if account_guid is None:
                 sale_warnings.append(f"UNMAPPED: No Etsy mapping for {etsy_mapping_key(row)}")
@@ -270,8 +300,10 @@ def build_etsy_transactions(
 
         transactions.append(
             _finalize_transaction(
-                dedupe_key=f"etsy:sale:{order_id}",
+                dedupe_key=f"etsy:sale:{account_key}:{order_id}",
                 marketplace="etsy",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="sale",
                 txn_id=order_id,
                 txn_date=sale_date,
@@ -289,16 +321,16 @@ def build_etsy_transactions(
         if row.row_type == "Fee" and row.title == "Listing fee":
             listing_warnings: list[str] = []
             mapping_key = etsy_mapping_key(row)
-            account_guid = mapping.etsy_fee_accounts.get(mapping_key)
+            account_guid = account_mapping.fee_accounts.get(mapping_key)
             if account_guid is None:
                 listing_warnings.append(f"UNMAPPED: No Etsy mapping for {mapping_key}")
 
             clearing_amount = row.net or ZERO
             splits: list[PlannedSplit] = []
-            if mapping.etsy_clearing_guid:
+            if account_mapping.clearing_guid:
                 splits.append(
                     PlannedSplit(
-                        account_guid=mapping.etsy_clearing_guid,
+                        account_guid=account_mapping.clearing_guid,
                         amount=clearing_amount,
                         memo="Listing fee clearing",
                     )
@@ -324,8 +356,10 @@ def build_etsy_transactions(
 
             transactions.append(
                 _finalize_transaction(
-                    dedupe_key=f"etsy:listing_fee:{row.row_id}",
+                    dedupe_key=f"etsy:listing_fee:{account_key}:{row.row_id}",
                     marketplace="etsy",
+                    marketplace_account_key=account_key,
+                    marketplace_account_label=account_label,
                     txn_kind="listing_fee",
                     txn_id=row.listing_id or row.row_id,
                     txn_date=row.date,
@@ -365,10 +399,10 @@ def build_etsy_transactions(
             clearing_amount += source_row.net or ZERO
 
         splits: list[PlannedSplit] = []
-        if mapping.etsy_clearing_guid:
+        if account_mapping.clearing_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.etsy_clearing_guid,
+                    account_guid=account_mapping.clearing_guid,
                     amount=clearing_amount,
                     memo=f"Refund Order #{order_id} net",
                 )
@@ -387,7 +421,7 @@ def build_etsy_transactions(
         for adj in related_adjustments:
             if adj.row_type != "Fee":
                 continue
-            key, account_guid = _lookup_etsy_fee_account(mapping, adj)
+            key, account_guid = _lookup_etsy_fee_account_for_marketplace(account_mapping, adj)
             fee_amount = -(adj.net or ZERO)
             fee_adjustment_total += fee_amount
             if account_guid is None:
@@ -402,10 +436,10 @@ def build_etsy_transactions(
             )
 
         refunds_amount = -(clearing_amount + fee_adjustment_total)
-        if mapping.etsy_refunds_guid:
+        if account_mapping.refunds_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.etsy_refunds_guid,
+                    account_guid=account_mapping.refunds_guid,
                     amount=refunds_amount,
                     memo=f"Refund expense Order #{order_id}",
                     mapping_key="etsy:refunds",
@@ -424,8 +458,10 @@ def build_etsy_transactions(
 
         transactions.append(
             _finalize_transaction(
-                dedupe_key=f"etsy:refund:{row.row_id}",
+                dedupe_key=f"etsy:refund:{account_key}:{row.row_id}",
                 marketplace="etsy",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="refund",
                 txn_id=order_id,
                 txn_date=row.date,
@@ -463,8 +499,17 @@ def build_etsy_transactions(
 def build_etsy_deposit_match_candidates(
     data: EtsyInputData,
     mapping: MappingConfig,
+    *,
+    account_key: str,
+    account_label: str,
 ) -> tuple[PlannedTransaction, ...]:
-    if not mapping.etsy_clearing_guid:
+    account_mapping = marketplace_mapping(
+        mapping,
+        account_key=account_key,
+        marketplace="etsy",
+        account_label=account_label,
+    )
+    if not account_mapping.clearing_guid:
         return ()
 
     candidates: list[PlannedTransaction] = []
@@ -478,8 +523,10 @@ def build_etsy_deposit_match_candidates(
         external_ref = row.order_id or row.row_id
         candidates.append(
             PlannedTransaction(
-                dedupe_key=f"etsy:deposit:{row.row_id}",
+                dedupe_key=f"etsy:deposit:{account_key}:{row.row_id}",
                 marketplace="etsy",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="deposit_match",
                 txn_id=row.row_id,
                 date=row.date,
@@ -488,7 +535,7 @@ def build_etsy_deposit_match_candidates(
                 clearing_amount=amount,
                 splits=(
                     PlannedSplit(
-                        account_guid=mapping.etsy_clearing_guid,
+                        account_guid=account_mapping.clearing_guid,
                         amount=amount,
                         memo=f"Etsy deposit {external_ref}",
                         mapping_key="etsy:deposit-match",
@@ -512,8 +559,17 @@ def build_etsy_deposit_match_candidates(
 def build_etsy_payment_match_candidates(
     data: EtsyInputData,
     mapping: MappingConfig,
+    *,
+    account_key: str,
+    account_label: str,
 ) -> tuple[PlannedTransaction, ...]:
-    if not mapping.etsy_clearing_guid:
+    account_mapping = marketplace_mapping(
+        mapping,
+        account_key=account_key,
+        marketplace="etsy",
+        account_label=account_label,
+    )
+    if not account_mapping.clearing_guid:
         return ()
 
     candidates: list[PlannedTransaction] = []
@@ -528,8 +584,10 @@ def build_etsy_payment_match_candidates(
         description = row.title or f"Etsy Payment {external_ref}"
         candidates.append(
             PlannedTransaction(
-                dedupe_key=f"etsy:payment:{row.row_id}",
+                dedupe_key=f"etsy:payment:{account_key}:{row.row_id}",
                 marketplace="etsy",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="payment_match",
                 txn_id=row.row_id,
                 date=row.date,
@@ -538,7 +596,7 @@ def build_etsy_payment_match_candidates(
                 clearing_amount=amount,
                 splits=(
                     PlannedSplit(
-                        account_guid=mapping.etsy_clearing_guid,
+                        account_guid=account_mapping.clearing_guid,
                         amount=amount,
                         memo=f"Etsy payment {external_ref}",
                         mapping_key="etsy:payment-match",
@@ -562,9 +620,18 @@ def build_etsy_payment_match_candidates(
 def build_ebay_transactions(
     data: EbayInputData,
     mapping: MappingConfig,
+    *,
+    account_key: str,
+    account_label: str,
 ) -> tuple[tuple[PlannedTransaction, ...], tuple[str, ...], tuple[str, ...]]:
     transactions: list[PlannedTransaction] = []
     warnings: list[str] = []
+    account_mapping = marketplace_mapping(
+        mapping,
+        account_key=account_key,
+        marketplace="ebay",
+        account_label=account_label,
+    )
 
     rows = data.report_rows
     by_order: dict[str, list[EbayReportRow]] = defaultdict(list)
@@ -593,10 +660,10 @@ def build_ebay_transactions(
                 fee_totals[col_name] += fee_amount
 
         splits: list[PlannedSplit] = []
-        if mapping.ebay_clearing_guid:
+        if account_mapping.clearing_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.ebay_clearing_guid,
+                    account_guid=account_mapping.clearing_guid,
                     amount=clearing_amount,
                     memo=f"Order {order_number} net",
                 )
@@ -611,10 +678,10 @@ def build_ebay_transactions(
                 )
             )
 
-        if mapping.ebay_income_guid:
+        if account_mapping.income_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.ebay_income_guid,
+                    account_guid=account_mapping.income_guid,
                     amount=-income_base,
                     memo=f"Order {order_number} sales income",
                 )
@@ -633,7 +700,7 @@ def build_ebay_transactions(
             if raw_fee_value == ZERO:
                 continue
             key = ebay_mapping_key(fee_column)
-            account_guid = mapping.ebay_fee_accounts.get(key)
+            account_guid = account_mapping.fee_accounts.get(key)
             if account_guid is None:
                 sale_warnings.append(f"UNMAPPED: No eBay mapping for {key}")
             splits.append(
@@ -652,8 +719,10 @@ def build_ebay_transactions(
 
         transactions.append(
             _finalize_transaction(
-                dedupe_key=f"ebay:sale:{order_number}",
+                dedupe_key=f"ebay:sale:{account_key}:{order_number}",
                 marketplace="ebay",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="sale",
                 txn_id=order_number,
                 txn_date=txn_date,
@@ -676,10 +745,10 @@ def build_ebay_transactions(
         fee_total = ZERO
         splits: list[PlannedSplit] = []
 
-        if mapping.ebay_clearing_guid:
+        if account_mapping.clearing_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.ebay_clearing_guid,
+                    account_guid=account_mapping.clearing_guid,
                     amount=row.net_amount,
                     memo=f"Refund {order_number} net",
                 )
@@ -698,7 +767,7 @@ def build_ebay_transactions(
             if raw_fee_value == ZERO:
                 continue
             key = ebay_mapping_key(fee_column)
-            account_guid = mapping.ebay_fee_accounts.get(key)
+            account_guid = account_mapping.fee_accounts.get(key)
             if account_guid is None:
                 refund_warnings.append(f"UNMAPPED: No eBay mapping for {key}")
 
@@ -714,10 +783,10 @@ def build_ebay_transactions(
             )
 
         refunds_amount = -(row.net_amount + fee_total)
-        if mapping.ebay_refunds_guid:
+        if account_mapping.refunds_guid:
             splits.append(
                 PlannedSplit(
-                    account_guid=mapping.ebay_refunds_guid,
+                    account_guid=account_mapping.refunds_guid,
                     amount=refunds_amount,
                     memo=f"Refund expense {order_number}",
                     mapping_key="ebay:refunds",
@@ -736,8 +805,10 @@ def build_ebay_transactions(
 
         transactions.append(
             _finalize_transaction(
-                dedupe_key=f"ebay:refund:{row.row_id}",
+                dedupe_key=f"ebay:refund:{account_key}:{row.row_id}",
                 marketplace="ebay",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="refund",
                 txn_id=order_number,
                 txn_date=row.date,
@@ -770,8 +841,17 @@ def build_ebay_transactions(
 def build_ebay_payout_match_candidates(
     data: EbayInputData,
     mapping: MappingConfig,
+    *,
+    account_key: str,
+    account_label: str,
 ) -> tuple[PlannedTransaction, ...]:
-    if not mapping.ebay_clearing_guid:
+    account_mapping = marketplace_mapping(
+        mapping,
+        account_key=account_key,
+        marketplace="ebay",
+        account_label=account_label,
+    )
+    if not account_mapping.clearing_guid:
         return ()
 
     candidates: list[PlannedTransaction] = []
@@ -785,8 +865,10 @@ def build_ebay_payout_match_candidates(
         description = row.description or f"eBay Payout {external_ref}"
         candidates.append(
             PlannedTransaction(
-                dedupe_key=f"ebay:payout:{row.row_id}",
+                dedupe_key=f"ebay:payout:{account_key}:{row.row_id}",
                 marketplace="ebay",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
                 txn_kind="payout_match",
                 txn_id=external_ref,
                 date=row.date,
@@ -795,7 +877,7 @@ def build_ebay_payout_match_candidates(
                 clearing_amount=amount,
                 splits=(
                     PlannedSplit(
-                        account_guid=mapping.ebay_clearing_guid,
+                        account_guid=account_mapping.clearing_guid,
                         amount=amount,
                         memo=f"eBay payout {external_ref}",
                         mapping_key="ebay:payout-match",
@@ -837,10 +919,7 @@ def build_bank_transactions(
         txn
         for txn in marketplace_transactions
         if not _has_blocking_warnings(txn)
-        and (
-            (mapping.etsy_clearing_guid and any(split.account_guid == mapping.etsy_clearing_guid for split in txn.splits))
-            or (mapping.ebay_clearing_guid and any(split.account_guid == mapping.ebay_clearing_guid for split in txn.splits))
-        )
+        and _find_clearing_account_guid(txn) is not None
     ]
 
     for bank_import, statements in bank_imports:
@@ -972,6 +1051,8 @@ def build_bank_transactions(
                     _finalize_transaction(
                         dedupe_key=dedupe_key,
                         marketplace="bank",
+                        marketplace_account_key=None,
+                        marketplace_account_label=None,
                         txn_kind="statement",
                         txn_id=txn_id,
                         txn_date=row.date,
@@ -1029,6 +1110,9 @@ def _find_marketplace_match(
                 account_guid=clearing_guid,
                 amount=-matched_transaction.clearing_amount,
                 memo=f"Matched clearing for {bank_description}",
+                marketplace=matched_transaction.marketplace,
+                marketplace_account_key=matched_transaction.marketplace_account_key,
+                marketplace_account_label=matched_transaction.marketplace_account_label,
             ),
         ) if clearing_guid else ()
         return BankMatchResult(
@@ -1041,6 +1125,11 @@ def _find_marketplace_match(
             match_source=match_source,
             matched_transaction_ids=(matched_transaction.dedupe_key,),
             targets=targets,
+            marketplace_account_labels=tuple(
+                value
+                for value in [matched_transaction.marketplace_account_label]
+                if value
+            ),
         )
     if len(payout_candidates) > 1:
         match_source = payout_candidates[0].txn_kind.replace("_match", "")
@@ -1054,6 +1143,15 @@ def _find_marketplace_match(
             match_source=match_source,
             matched_transaction_ids=tuple(txn.dedupe_key for txn in payout_candidates),
             targets=(),
+            marketplace_account_labels=tuple(
+                sorted(
+                    {
+                        txn.marketplace_account_label
+                        for txn in payout_candidates
+                        if txn.marketplace_account_label
+                    }
+                )
+            ),
         )
 
     candidates = [
@@ -1072,25 +1170,40 @@ def _find_marketplace_match(
         for txn in candidates
         if abs((bank_date - txn.date).days) <= 7
     ]
-    candidates.sort(key=lambda txn: (abs((bank_date - txn.date).days), txn.date, txn.txn_id))
-    candidates = candidates[:10]
+    grouped_candidates: dict[str, list[PlannedTransaction]] = defaultdict(list)
+    for txn in candidates:
+        group_key = txn.marketplace_account_key or txn.marketplace
+        grouped_candidates[group_key].append(txn)
 
-    matches = _find_exact_transaction_subsets(candidates, bank_amount)
+    matches: list[tuple[PlannedTransaction, ...]] = []
+    for group in grouped_candidates.values():
+        group.sort(key=lambda txn: (abs((bank_date - txn.date).days), txn.date, txn.txn_id))
+        matches.extend(_find_exact_transaction_subsets(group[:10], bank_amount))
     if len(matches) == 1:
         matched_transactions = tuple(sorted(matches[0], key=lambda txn: (txn.date, txn.txn_id, txn.dedupe_key)))
-        grouped_targets: dict[str, Decimal] = defaultdict(lambda: ZERO)
+        grouped_targets: dict[tuple[str, str | None, str | None, str], Decimal] = defaultdict(lambda: ZERO)
         for txn in matched_transactions:
             clearing_guid = _find_clearing_account_guid(txn)
             if clearing_guid is None:
                 continue
-            grouped_targets[clearing_guid] += txn.clearing_amount
+            grouped_targets[
+                (
+                    clearing_guid,
+                    txn.marketplace_account_key,
+                    txn.marketplace_account_label,
+                    txn.marketplace,
+                )
+            ] += txn.clearing_amount
         targets = tuple(
             BankMatchTarget(
                 account_guid=account_guid,
                 amount=-amount,
                 memo=f"Matched clearing for {bank_description}",
+                marketplace=marketplace,
+                marketplace_account_key=marketplace_account_key,
+                marketplace_account_label=marketplace_account_label,
             )
-            for account_guid, amount in sorted(grouped_targets.items())
+            for (account_guid, marketplace_account_key, marketplace_account_label, marketplace), amount in sorted(grouped_targets.items())
         )
         return BankMatchResult(
             bank_dedupe_key=bank_dedupe_key,
@@ -1102,6 +1215,15 @@ def _find_marketplace_match(
             match_source="auto",
             matched_transaction_ids=tuple(txn.dedupe_key for txn in matched_transactions),
             targets=targets,
+            marketplace_account_labels=tuple(
+                sorted(
+                    {
+                        txn.marketplace_account_label
+                        for txn in matched_transactions
+                        if txn.marketplace_account_label
+                    }
+                )
+            ),
         )
 
     status = "ambiguous" if len(matches) > 1 else "unmatched"
@@ -1115,6 +1237,7 @@ def _find_marketplace_match(
         match_source="auto",
         matched_transaction_ids=(),
         targets=(),
+        marketplace_account_labels=(),
     )
 
 
@@ -1147,7 +1270,7 @@ def _resolve_manual_override(
         matched_transactions.append(txn)
 
     total = ZERO
-    grouped_targets: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    grouped_targets: dict[tuple[str, str | None, str | None, str], Decimal] = defaultdict(lambda: ZERO)
     for txn in matched_transactions:
         total += txn.clearing_amount
         clearing_guid = _find_clearing_account_guid(txn)
@@ -1163,7 +1286,14 @@ def _resolve_manual_override(
                 matched_transaction_ids=override_ids,
                 targets=(),
             )
-        grouped_targets[clearing_guid] += txn.clearing_amount
+        grouped_targets[
+            (
+                clearing_guid,
+                txn.marketplace_account_key,
+                txn.marketplace_account_label,
+                txn.marketplace,
+            )
+        ] += txn.clearing_amount
 
     if total != bank_amount:
         return BankMatchResult(
@@ -1183,8 +1313,11 @@ def _resolve_manual_override(
             account_guid=account_guid,
             amount=-amount,
             memo=f"Matched clearing for {bank_description}",
+            marketplace=marketplace,
+            marketplace_account_key=marketplace_account_key,
+            marketplace_account_label=marketplace_account_label,
         )
-        for account_guid, amount in sorted(grouped_targets.items())
+        for (account_guid, marketplace_account_key, marketplace_account_label, marketplace), amount in sorted(grouped_targets.items())
     )
     return BankMatchResult(
         bank_dedupe_key=bank_dedupe_key,
@@ -1196,6 +1329,15 @@ def _resolve_manual_override(
         match_source="manual",
         matched_transaction_ids=override_ids,
         targets=targets,
+        marketplace_account_labels=tuple(
+            sorted(
+                {
+                    txn.marketplace_account_label
+                    for txn in matched_transactions
+                    if txn.marketplace_account_label
+                }
+            )
+        ),
     )
 
 

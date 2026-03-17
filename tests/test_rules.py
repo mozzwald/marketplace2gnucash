@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 from market2gnucash.core.models import (
     BankImportSpec,
     MappingConfig,
+    MarketplaceAccountMapping,
     PlannedSplit,
     PlannedTransaction,
 )
@@ -27,10 +29,11 @@ from market2gnucash.core.rules import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"
+RS_SAMPLES = SAMPLES / "RS"
 
 
 class RuleEngineTests(unittest.TestCase):
-    def _etsy_mapping(self) -> MappingConfig:
+    def _etsy_mapping(self, account_key: str = "etsy:shop-a", account_label: str = "Etsy Shop A") -> MappingConfig:
         etsy_fee_accounts = {
             "etsy:Fee:Listing fee": "guid-exp-listing",
             "etsy:Fee:Transaction fee: Shipping": "guid-exp-fee",
@@ -40,33 +43,48 @@ class RuleEngineTests(unittest.TestCase):
             "etsy:Fee:Credit for processing fee": "guid-exp-fee",
         }
         return MappingConfig(
-            etsy_clearing_guid="guid-asset-etsy",
-            etsy_income_guid="guid-income-etsy",
-            etsy_refunds_guid="guid-exp-refunds",
-            etsy_fee_accounts=etsy_fee_accounts,
+            marketplace_accounts={
+                account_key: MarketplaceAccountMapping(
+                    marketplace="etsy",
+                    account_label=account_label,
+                    clearing_guid="guid-asset-etsy",
+                    income_guid="guid-income-etsy",
+                    refunds_guid="guid-exp-refunds",
+                    fee_accounts=etsy_fee_accounts,
+                )
+            },
         )
 
-    def _ebay_mapping(self, fee_columns: tuple[str, ...]) -> MappingConfig:
+    def _ebay_mapping(self, fee_columns: tuple[str, ...], account_key: str = "ebay:main", account_label: str = "eBay Main") -> MappingConfig:
         ebay_fee_accounts = {f"ebay:fee_col:{col}": "guid-exp-ebay-fees" for col in fee_columns}
         return MappingConfig(
-            ebay_clearing_guid="guid-asset-ebay",
-            ebay_income_guid="guid-income-ebay",
-            ebay_refunds_guid="guid-exp-refunds-ebay",
-            ebay_fee_accounts=ebay_fee_accounts,
+            marketplace_accounts={
+                account_key: MarketplaceAccountMapping(
+                    marketplace="ebay",
+                    account_label=account_label,
+                    clearing_guid="guid-asset-ebay",
+                    income_guid="guid-income-ebay",
+                    refunds_guid="guid-exp-refunds-ebay",
+                    fee_accounts=ebay_fee_accounts,
+                )
+            },
         )
 
-    def _bank_mapping(self, source_key: str) -> MappingConfig:
-        return MappingConfig(
-            etsy_clearing_guid="guid-asset-etsy",
-        )
+    def _bank_mapping(self, account_key: str = "etsy:shop-a", account_label: str = "Etsy Shop A") -> MappingConfig:
+        return self._etsy_mapping(account_key=account_key, account_label=account_label)
 
     def test_etsy_rules_one_sale_per_order_and_listing_per_row(self) -> None:
         etsy_data = parse_etsy_inputs(
-            SAMPLES / "etsy_statement_2026_1.csv",
-            SAMPLES / "EtsySoldOrders2026-1.csv",
+            RS_SAMPLES / "etsy_statement_2026_1.csv",
+            RS_SAMPLES / "EtsySoldOrders2026-1.csv",
         )
 
-        transactions, warnings, _keys = build_etsy_transactions(etsy_data, self._etsy_mapping())
+        transactions, warnings, _keys = build_etsy_transactions(
+            etsy_data,
+            self._etsy_mapping(),
+            account_key="etsy:shop-a",
+            account_label="Etsy Shop A",
+        )
 
         sales = [txn for txn in transactions if txn.txn_kind == "sale"]
         refunds = [txn for txn in transactions if txn.txn_kind == "refund"]
@@ -91,7 +109,12 @@ class RuleEngineTests(unittest.TestCase):
         ebay_data = parse_ebay_report(SAMPLES / "eBay-Transaction_report_20260101_20260131.csv")
         mapping = self._ebay_mapping(ebay_data.fee_columns)
 
-        transactions, _warnings, _columns = build_ebay_transactions(ebay_data, mapping)
+        transactions, _warnings, _columns = build_ebay_transactions(
+            ebay_data,
+            mapping,
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
 
         sales = [txn for txn in transactions if txn.txn_kind == "sale"]
         refunds = [txn for txn in transactions if txn.txn_kind == "refund"]
@@ -109,6 +132,36 @@ class RuleEngineTests(unittest.TestCase):
         for refund in refunds:
             income_memos = [split.memo for split in refund.splits if "sales income" in split.memo.lower()]
             self.assertEqual(income_memos, [])
+
+    def test_marketplace_dedupe_keys_do_not_collide_across_accounts(self) -> None:
+        etsy_data = parse_etsy_inputs(
+            RS_SAMPLES / "etsy_statement_2026_1.csv",
+            RS_SAMPLES / "EtsySoldOrders2026-1.csv",
+        )
+        mapping = MappingConfig(
+            marketplace_accounts={
+                **self._etsy_mapping("etsy:shop-a", "Shop A").marketplace_accounts,
+                **self._etsy_mapping("etsy:shop-b", "Shop B").marketplace_accounts,
+            }
+        )
+
+        shop_a_txns, _warnings_a, _keys_a = build_etsy_transactions(
+            etsy_data,
+            mapping,
+            account_key="etsy:shop-a",
+            account_label="Shop A",
+        )
+        shop_b_txns, _warnings_b, _keys_b = build_etsy_transactions(
+            etsy_data,
+            mapping,
+            account_key="etsy:shop-b",
+            account_label="Shop B",
+        )
+
+        self.assertTrue(shop_a_txns)
+        self.assertEqual(len({txn.dedupe_key for txn in shop_a_txns + shop_b_txns}), len(shop_a_txns) + len(shop_b_txns))
+        self.assertTrue(all(txn.marketplace_account_key == "etsy:shop-a" for txn in shop_a_txns))
+        self.assertTrue(all(txn.marketplace_account_key == "etsy:shop-b" for txn in shop_b_txns))
 
     def test_bank_rules_one_transaction_per_statement_row(self) -> None:
         csv_text = "\n".join(
@@ -184,8 +237,10 @@ class RuleEngineTests(unittest.TestCase):
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
         marketplace_transactions = (
             PlannedTransaction(
-                dedupe_key="etsy:sale:1",
+                dedupe_key="etsy:sale:etsy:shop-a:1",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="1",
                 date=date(2026, 3, 1),
@@ -199,8 +254,10 @@ class RuleEngineTests(unittest.TestCase):
                 source_row_ids=("r1",),
             ),
             PlannedTransaction(
-                dedupe_key="etsy:sale:2",
+                dedupe_key="etsy:sale:etsy:shop-a:2",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="2",
                 date=date(2026, 3, 2),
@@ -228,7 +285,7 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(match_results[0].status, "matched")
         self.assertEqual(
             match_results[0].matched_transaction_ids,
-            ("etsy:sale:1", "etsy:sale:2"),
+            ("etsy:sale:etsy:shop-a:1", "etsy:sale:etsy:shop-a:2"),
         )
         self.assertEqual(sum(split.amount for split in transactions[0].splits), Decimal("0"))
         self.assertEqual(len(transactions[0].splits), 2)
@@ -236,10 +293,15 @@ class RuleEngineTests(unittest.TestCase):
 
     def test_bank_rules_match_etsy_deposit_candidates_before_subset_matching(self) -> None:
         etsy_data = parse_etsy_inputs(
-            SAMPLES / "etsy_statement_2026_2.csv",
-            SAMPLES / "EtsySoldOrders2026-2.csv",
+            RS_SAMPLES / "etsy_statement_2026_2.csv",
+            RS_SAMPLES / "EtsySoldOrders2026-2.csv",
         )
-        deposit_candidates = build_etsy_deposit_match_candidates(etsy_data, self._etsy_mapping())
+        deposit_candidates = build_etsy_deposit_match_candidates(
+            etsy_data,
+            self._etsy_mapping(),
+            account_key="etsy:shop-a",
+            account_label="Etsy Shop A",
+        )
         target = next(candidate for candidate in deposit_candidates if candidate.clearing_amount == Decimal("118.37"))
 
         csv_text = "\n".join(
@@ -257,8 +319,10 @@ class RuleEngineTests(unittest.TestCase):
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
         marketplace_transactions = (
             PlannedTransaction(
-                dedupe_key="etsy:sale:subset-a",
+                dedupe_key="etsy:sale:etsy:shop-a:subset-a",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="subset-a",
                 date=target.date,
@@ -272,8 +336,10 @@ class RuleEngineTests(unittest.TestCase):
                 source_row_ids=("sa",),
             ),
             PlannedTransaction(
-                dedupe_key="etsy:sale:subset-b",
+                dedupe_key="etsy:sale:etsy:shop-a:subset-b",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="subset-b",
                 date=target.date,
@@ -320,7 +386,12 @@ class RuleEngineTests(unittest.TestCase):
             mini_statement = parse_bank_statement_file(path)
 
         ebay_data = parse_ebay_report(SAMPLES / "eBay-Transaction_report_20260101_20260131.csv")
-        payout_candidates = build_ebay_payout_match_candidates(ebay_data, self._ebay_mapping(ebay_data.fee_columns))
+        payout_candidates = build_ebay_payout_match_candidates(
+            ebay_data,
+            self._ebay_mapping(ebay_data.fee_columns),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
         self.assertTrue(any(candidate.clearing_amount == Decimal("4.78") for candidate in payout_candidates))
 
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
@@ -340,10 +411,15 @@ class RuleEngineTests(unittest.TestCase):
 
     def test_bank_rules_match_etsy_payment_candidates(self) -> None:
         etsy_data = parse_etsy_inputs(
-            SAMPLES / "etsy_statement_2026_1.csv",
-            SAMPLES / "EtsySoldOrders2026-1.csv",
+            RS_SAMPLES / "etsy_statement_2026_1.csv",
+            RS_SAMPLES / "EtsySoldOrders2026-1.csv",
         )
-        payment_candidates = build_etsy_payment_match_candidates(etsy_data, self._etsy_mapping())
+        payment_candidates = build_etsy_payment_match_candidates(
+            etsy_data,
+            self._etsy_mapping(),
+            account_key="etsy:shop-a",
+            account_label="Etsy Shop A",
+        )
         target = next(candidate for candidate in payment_candidates if candidate.clearing_amount == Decimal("-1.00"))
 
         csv_text = "\n".join(
@@ -373,6 +449,70 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(match_results[0].match_source, "payment")
         self.assertEqual(match_results[0].matched_transaction_ids, (target.dedupe_key,))
 
+    def test_bank_rules_mark_ambiguous_when_multiple_accounts_have_same_payout(self) -> None:
+        csv_text = "\n".join(
+            [
+                "Date,Description,Amount,Reference,Currency",
+                "03/20/2026,Marketplace Deposit,80.00,B3,USD",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "checking.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            statement = parse_bank_statement_file(path)
+
+        bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
+        payout_candidates = (
+            PlannedTransaction(
+                dedupe_key="etsy:deposit:etsy:shop-a:dep1",
+                marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
+                txn_kind="deposit_match",
+                txn_id="dep1",
+                date=date(2026, 3, 20),
+                description="Etsy deposit",
+                external_ref="dep1",
+                clearing_amount=Decimal("80.00"),
+                splits=(
+                    PlannedSplit(account_guid="guid-asset-etsy", amount=Decimal("80.00"), memo="clearing"),
+                    PlannedSplit(account_guid=None, amount=Decimal("-80.00"), memo="offset"),
+                ),
+                source_row_ids=("dep1",),
+            ),
+            PlannedTransaction(
+                dedupe_key="ebay:payout:ebay:main:pay1",
+                marketplace="ebay",
+                marketplace_account_key="ebay:main",
+                marketplace_account_label="eBay Main",
+                txn_kind="payout_match",
+                txn_id="pay1",
+                date=date(2026, 3, 20),
+                description="eBay payout",
+                external_ref="pay1",
+                clearing_amount=Decimal("80.00"),
+                splits=(
+                    PlannedSplit(account_guid="guid-asset-ebay", amount=Decimal("80.00"), memo="clearing"),
+                    PlannedSplit(account_guid=None, amount=Decimal("-80.00"), memo="offset"),
+                ),
+                source_row_ids=("pay1",),
+            ),
+        )
+
+        transactions, warnings, match_results, category_results = build_bank_transactions(
+            ((bank_import, (statement,)),),
+            MappingConfig(),
+            (),
+            marketplace_payout_candidates=payout_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(match_results[0].status, "ambiguous")
+        self.assertEqual(set(match_results[0].marketplace_account_labels), {"Etsy Shop A", "eBay Main"})
+
     def test_bank_rules_manual_override_is_used(self) -> None:
         csv_text = "\n".join(
             [
@@ -389,8 +529,10 @@ class RuleEngineTests(unittest.TestCase):
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
         marketplace_transactions = (
             PlannedTransaction(
-                dedupe_key="etsy:sale:10",
+                dedupe_key="etsy:sale:etsy:shop-a:10",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="10",
                 date=date(2026, 3, 1),
@@ -404,8 +546,10 @@ class RuleEngineTests(unittest.TestCase):
                 source_row_ids=("r10",),
             ),
             PlannedTransaction(
-                dedupe_key="etsy:sale:20",
+                dedupe_key="etsy:sale:etsy:shop-a:20",
                 marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
                 txn_kind="sale",
                 txn_id="20",
                 date=date(2026, 3, 2),
@@ -421,10 +565,11 @@ class RuleEngineTests(unittest.TestCase):
         )
 
         bank_dedupe_key = "bank:guid-bank-account:B2"
-        mapping = MappingConfig(
-            etsy_clearing_guid="guid-asset-etsy",
-            bank_suspense_guid="guid-bank-suspense",
-            bank_match_overrides={bank_dedupe_key: ("etsy:sale:10", "etsy:sale:20")},
+        mapping = replace(
+            self._etsy_mapping(),
+            bank_match_overrides={
+                bank_dedupe_key: ("etsy:sale:etsy:shop-a:10", "etsy:sale:etsy:shop-a:20")
+            },
         )
         transactions, warnings, match_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
@@ -457,7 +602,6 @@ class RuleEngineTests(unittest.TestCase):
 
         bank_import = BankImportSpec(account_guid="guid-card", statement_paths=(str(path),))
         mapping = MappingConfig(
-            bank_suspense_guid="guid-suspense",
             bank_merchant_accounts={merchant_key: "guid-exp-coffee"},
         )
         transactions, warnings, match_results, category_results = build_bank_transactions(
@@ -493,7 +637,6 @@ class RuleEngineTests(unittest.TestCase):
         bank_import = BankImportSpec(account_guid="guid-card", statement_paths=(str(path),))
         merchant_key = bank_merchant_key("Starbucks #1234")
         mapping = MappingConfig(
-            bank_suspense_guid="guid-suspense",
             bank_merchant_accounts={merchant_key: "guid-exp-coffee"},
             bank_txn_account_overrides={"bank:guid-card:A2": "guid-exp-meals"},
         )

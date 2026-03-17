@@ -43,9 +43,9 @@ class MatchOverrideDialog(QDialog):
         layout.addWidget(QLabel(f"Target amount: {bank_amount}"))
 
         self.candidates_table = QTableWidget()
-        self.candidates_table.setColumnCount(6)
+        self.candidates_table.setColumnCount(7)
         self.candidates_table.setHorizontalHeaderLabels(
-            ["Date", "Marketplace", "Type", "ID", "Amount", "Status"]
+            ["Date", "Marketplace", "Market Acct", "Type", "ID", "Amount", "Status"]
         )
         self.candidates_table.setRowCount(len(candidates))
         self.candidates_table.verticalHeader().setVisible(False)
@@ -58,6 +58,7 @@ class MatchOverrideDialog(QDialog):
             row_items = [
                 QTableWidgetItem(txn.date.isoformat()),
                 QTableWidgetItem(txn.marketplace),
+                QTableWidgetItem(txn.marketplace_account_label or ""),
                 QTableWidgetItem(txn.txn_kind),
                 QTableWidgetItem(txn.txn_id),
                 QTableWidgetItem(str(txn.clearing_amount)),
@@ -114,11 +115,12 @@ class BankMappingTab(QWidget):
         layout.addLayout(tools_row)
 
         self.txn_table = QTableWidget()
-        self.txn_table.setColumnCount(8)
+        self.txn_table.setColumnCount(9)
         self.txn_table.setHorizontalHeaderLabels(
-            ["Date", "Bank Acct", "Description", "Amount", "Marketplace Txns", "Account", "Actions", "Rule"]
+            ["Date", "Bank Acct", "Description", "Amount", "Marketplace Txns", "Market Acct", "Account", "Actions", "Rule"]
         )
         self.txn_table.verticalHeader().setVisible(False)
+        self.txn_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.txn_table.setSortingEnabled(True)
         layout.addWidget(QLabel("Bank / Card Transactions"))
         layout.addWidget(self.txn_table)
@@ -177,6 +179,7 @@ class BankMappingTab(QWidget):
                 account_label = account.full_name if account else "(unmapped)"
                 mapped = account is not None
             merchant_rule = category_result.merchant_key if category_result else ""
+            marketplace_account_label = "\n".join(match_result.marketplace_account_labels)
             matched_ids = (
                 "\n".join(self._format_match_label(value) for value in match_result.matched_transaction_ids)
                 if match_result.matched_transaction_ids
@@ -190,6 +193,7 @@ class BankMappingTab(QWidget):
                 QTableWidgetItem(match_result.bank_description),
                 QTableWidgetItem(str(match_result.bank_amount)),
                 QTableWidgetItem(matched_ids),
+                QTableWidgetItem(marketplace_account_label),
                 QTableWidgetItem(account_label),
                 QTableWidgetItem(""),
                 QTableWidgetItem(merchant_rule),
@@ -230,7 +234,7 @@ class BankMappingTab(QWidget):
                 actions_layout.addWidget(account_button)
                 actions_layout.addWidget(clear_account_button)
             actions_layout.addStretch()
-            self.txn_table.setCellWidget(row_index, 6, actions_widget)
+            self.txn_table.setCellWidget(row_index, 7, actions_widget)
             self._apply_row_colors(row_index, matched=matched, mapped=mapped, actions_widget=actions_widget)
 
         self.txn_table.setSortingEnabled(True)
@@ -261,7 +265,7 @@ class BankMappingTab(QWidget):
                 button.setStyleSheet(f"background-color: {background}; color: black;")
 
         if matched and mapped:
-            for col in range(8):
+            for col in range(9):
                 item = self.txn_table.item(row_index, col)
                 if item is None:
                     continue
@@ -271,7 +275,7 @@ class BankMappingTab(QWidget):
             return
 
         if matched and not mapped:
-            for col in range(8):
+            for col in range(9):
                 item = self.txn_table.item(row_index, col)
                 if item is None:
                     continue
@@ -281,7 +285,7 @@ class BankMappingTab(QWidget):
             return
 
         if mapped and not matched:
-            for col in range(8):
+            for col in range(9):
                 item = self.txn_table.item(row_index, col)
                 if item is None:
                     continue
@@ -450,9 +454,7 @@ class BankMappingTab(QWidget):
                 book_id=book_id,
                 dedupe_store=self.app_state["dedupe_store"],
                 mapping=self.app_state["mapping_config"],
-                etsy_statement_path=inputs.get("etsy_statement_path"),
-                etsy_sold_orders_path=inputs.get("etsy_sold_orders_path"),
-                ebay_report_path=inputs.get("ebay_report_path"),
+                marketplace_imports=inputs.get("marketplace_imports", []),
                 bank_imports=inputs.get("bank_imports", []),
                 start_date=start_date,
                 end_date=end_date,
@@ -462,6 +464,5 @@ class BankMappingTab(QWidget):
             return
 
         self.app_state["plan_result"] = plan
-        self.app_state["etsy_mapping_keys"] = plan.etsy_mapping_keys
-        self.app_state["ebay_fee_columns"] = plan.ebay_fee_columns
+        self.app_state["marketplace_mapping_keys"] = dict(plan.marketplace_mapping_keys)
         self.app_state["notify_state_changed"]()

@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
             "mapping_config": MappingConfig(),
             "inputs": {},
             "plan_result": None,
+            "marketplace_mapping_keys": {},
             "config_store": ConfigStore(),
             "dedupe_store": DedupeStore(),
             "notify_state_changed": self._notify_tabs,

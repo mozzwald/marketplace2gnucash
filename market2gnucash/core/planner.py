@@ -8,6 +8,7 @@ from market2gnucash.core.models import (
     BankStatementData,
     BankCsvProfile,
     MappingConfig,
+    MarketplaceImportSpec,
     PlanResult,
     PlannedTransactionStatus,
 )
@@ -23,6 +24,7 @@ from market2gnucash.core.rules import (
     build_etsy_deposit_match_candidates,
     build_etsy_payment_match_candidates,
     build_etsy_transactions,
+    ebay_mapping_key,
 )
 
 
@@ -50,49 +52,112 @@ def build_plan(
     book_id: str,
     dedupe_store: DedupeStore,
     mapping: MappingConfig,
-    etsy_statement_path: str | None,
-    etsy_sold_orders_path: str | None,
-    ebay_report_path: str | None,
+    marketplace_imports: list[dict[str, object]] | tuple[dict[str, object], ...] | None,
     bank_imports: list[dict[str, object]] | tuple[dict[str, object], ...] | None,
     start_date: date | None,
     end_date: date | None,
 ) -> PlanResult:
     all_transactions = []
     all_warnings: list[str] = []
-    etsy_mapping_keys: tuple[str, ...] = ()
-    ebay_fee_columns: tuple[str, ...] = ()
+    marketplace_mapping_keys: dict[str, tuple[str, ...]] = {}
     bank_match_results = ()
     bank_category_results = ()
     marketplace_payout_candidates = ()
 
-    if etsy_statement_path or etsy_sold_orders_path:
-        if not (etsy_statement_path and etsy_sold_orders_path):
-            raise ValueError("Etsy import requires both statement CSV and SoldOrders CSV")
+    normalized_marketplace_imports: list[MarketplaceImportSpec] = []
+    for raw_import in marketplace_imports or ():
+        if not isinstance(raw_import, dict):
+            continue
+        marketplace = raw_import.get("marketplace")
+        account_key = raw_import.get("account_key")
+        account_label = raw_import.get("account_label")
+        import_id = raw_import.get("import_id")
+        if not all(isinstance(value, str) and value for value in (marketplace, account_key, account_label, import_id)):
+            continue
+        normalized_marketplace_imports.append(
+            MarketplaceImportSpec(
+                import_id=import_id,
+                marketplace=marketplace,
+                account_key=account_key,
+                account_label=account_label,
+                etsy_statement_path=raw_import.get("etsy_statement_path") if isinstance(raw_import.get("etsy_statement_path"), str) else None,
+                etsy_sold_orders_path=raw_import.get("etsy_sold_orders_path") if isinstance(raw_import.get("etsy_sold_orders_path"), str) else None,
+                ebay_report_path=raw_import.get("ebay_report_path") if isinstance(raw_import.get("ebay_report_path"), str) else None,
+            )
+        )
 
-        etsy_data = parse_etsy_inputs(
-            statement_path=etsy_statement_path,
-            sold_orders_path=etsy_sold_orders_path,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        etsy_txns, etsy_warnings, etsy_mapping_keys = build_etsy_transactions(etsy_data, mapping)
-        marketplace_payout_candidates = tuple(
-            [
-                *build_etsy_deposit_match_candidates(etsy_data, mapping),
-                *build_etsy_payment_match_candidates(etsy_data, mapping),
-            ]
-        )
-        all_transactions.extend(etsy_txns)
-        all_warnings.extend(etsy_warnings)
-
-    if ebay_report_path:
-        ebay_data = parse_ebay_report(ebay_report_path, start_date=start_date, end_date=end_date)
-        ebay_txns, ebay_warnings, ebay_fee_columns = build_ebay_transactions(ebay_data, mapping)
-        marketplace_payout_candidates = tuple(
-            [*marketplace_payout_candidates, *build_ebay_payout_match_candidates(ebay_data, mapping)]
-        )
-        all_transactions.extend(ebay_txns)
-        all_warnings.extend(ebay_warnings)
+    for marketplace_import in normalized_marketplace_imports:
+        if marketplace_import.marketplace == "etsy":
+            if not (marketplace_import.etsy_statement_path and marketplace_import.etsy_sold_orders_path):
+                raise ValueError(
+                    f"Etsy import '{marketplace_import.account_label}' requires both statement CSV and SoldOrders CSV"
+                )
+            etsy_data = parse_etsy_inputs(
+                statement_path=marketplace_import.etsy_statement_path,
+                sold_orders_path=marketplace_import.etsy_sold_orders_path,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            etsy_txns, etsy_warnings, etsy_mapping_keys = build_etsy_transactions(
+                etsy_data,
+                mapping,
+                account_key=marketplace_import.account_key,
+                account_label=marketplace_import.account_label,
+            )
+            marketplace_mapping_keys[marketplace_import.account_key] = tuple(sorted(set(etsy_mapping_keys)))
+            marketplace_payout_candidates = tuple(
+                [
+                    *marketplace_payout_candidates,
+                    *build_etsy_deposit_match_candidates(
+                        etsy_data,
+                        mapping,
+                        account_key=marketplace_import.account_key,
+                        account_label=marketplace_import.account_label,
+                    ),
+                    *build_etsy_payment_match_candidates(
+                        etsy_data,
+                        mapping,
+                        account_key=marketplace_import.account_key,
+                        account_label=marketplace_import.account_label,
+                    ),
+                ]
+            )
+            all_transactions.extend(etsy_txns)
+            all_warnings.extend(
+                f"[{marketplace_import.account_label}] {warning}" for warning in etsy_warnings
+            )
+        elif marketplace_import.marketplace == "ebay":
+            if not marketplace_import.ebay_report_path:
+                raise ValueError(f"eBay import '{marketplace_import.account_label}' requires a transaction report CSV")
+            ebay_data = parse_ebay_report(
+                marketplace_import.ebay_report_path,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            ebay_txns, ebay_warnings, ebay_fee_columns = build_ebay_transactions(
+                ebay_data,
+                mapping,
+                account_key=marketplace_import.account_key,
+                account_label=marketplace_import.account_label,
+            )
+            marketplace_mapping_keys[marketplace_import.account_key] = tuple(
+                sorted({ebay_mapping_key(column) for column in ebay_fee_columns})
+            )
+            marketplace_payout_candidates = tuple(
+                [
+                    *marketplace_payout_candidates,
+                    *build_ebay_payout_match_candidates(
+                        ebay_data,
+                        mapping,
+                        account_key=marketplace_import.account_key,
+                        account_label=marketplace_import.account_label,
+                    ),
+                ]
+            )
+            all_transactions.extend(ebay_txns)
+            all_warnings.extend(
+                f"[{marketplace_import.account_label}] {warning}" for warning in ebay_warnings
+            )
 
     if bank_imports:
         parsed_bank_imports: list[tuple[BankImportSpec, tuple[BankStatementData, ...]]] = []
@@ -164,8 +229,7 @@ def build_plan(
     return PlanResult(
         transactions=tuple(statuses),
         warnings=tuple(all_warnings),
-        etsy_mapping_keys=tuple(sorted(set(etsy_mapping_keys))),
-        ebay_fee_columns=tuple(sorted(set(ebay_fee_columns))),
+        marketplace_mapping_keys=marketplace_mapping_keys,
         bank_match_results=bank_match_results,
         bank_category_results=bank_category_results,
     )

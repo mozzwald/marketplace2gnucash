@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
@@ -35,6 +36,7 @@ class PreviewTab(QWidget):
             ["Date", "Market", "Kind", "ID", "Net", "Status", "Reason"]
         )
         self.txn_table.verticalHeader().setVisible(False)
+        self.txn_table.setSortingEnabled(True)
         self.txn_table.itemSelectionChanged.connect(self._show_selected_transaction_splits)
 
         self.split_table = QTableWidget()
@@ -106,6 +108,7 @@ class PreviewTab(QWidget):
             f"Planned transactions: {total} | Ready: {ready} | Duplicate: {duplicate} | Blocked: {blocked}"
         )
 
+        self.txn_table.setSortingEnabled(False)
         self.txn_table.setRowCount(total)
         for row_index, status_row in enumerate(plan.transactions):
             txn = status_row.transaction
@@ -119,8 +122,12 @@ class PreviewTab(QWidget):
                 status_row.status_reason,
             ]
             for col, value in enumerate(values):
-                self.txn_table.setItem(row_index, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.UserRole, txn.dedupe_key)
+                self.txn_table.setItem(row_index, col, item)
 
+        self.txn_table.setSortingEnabled(True)
         self.txn_table.resizeColumnsToContents()
 
         self.warning_list.clear()
@@ -140,11 +147,23 @@ class PreviewTab(QWidget):
 
         row = selected_items[0].row()
         plan: PlanResult | None = self.app_state.get("plan_result")
-        if plan is None or row >= len(plan.transactions):
+        if plan is None:
             self.split_table.setRowCount(0)
             return
 
-        transaction = plan.transactions[row].transaction
+        key_item = self.txn_table.item(row, 0)
+        if key_item is None:
+            self.split_table.setRowCount(0)
+            return
+        dedupe_key = key_item.data(Qt.UserRole)
+        transaction = next(
+            (status_row.transaction for status_row in plan.transactions if status_row.transaction.dedupe_key == dedupe_key),
+            None,
+        )
+        if transaction is None:
+            self.split_table.setRowCount(0)
+            return
+
         accounts_by_guid = self.app_state.get("accounts_by_guid", {})
 
         self.split_table.setRowCount(len(transaction.splits))

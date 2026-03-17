@@ -1,0 +1,14 @@
+# Workspace-specific
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+
+# Project docs/data that should stay local
+sample_imports/
+AGENTS.md
+
+# Build / packaging
+*.egg-info/
+dist/
+build/

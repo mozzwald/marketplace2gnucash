@@ -89,7 +89,7 @@ class MappingTab(QWidget):
             guid = getattr(mapping, field_name)
             account = accounts_by_guid.get(guid) if guid else None
             if account:
-                label.setText(f"{account.full_name} ({account.guid})")
+                label.setText(account.full_name)
             else:
                 label.setText("(not selected)")
 

@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 import re
 
-from market2gnucash.core.decimal_utils import ZERO
+from market2gnucash.core.decimal_utils import ZERO, parse_money
 from market2gnucash.core.models import (
     BankCategoryResult,
     BankMatchResult,
@@ -45,6 +45,7 @@ _BANK_NOISE_TOKENS = {
     "withdrawal",
     "deposit",
 }
+_TITLE_MONEY_RE = re.compile(r"(\$?\d[\d,]*\.\d{2})")
 
 
 def etsy_mapping_key(row: EtsyStatementRow) -> str:
@@ -81,6 +82,13 @@ def bank_merchant_key(description: str) -> str:
     if not filtered:
         return "uncategorized"
     return " ".join(filtered[:6])
+
+
+def _extract_money_from_text(text: str) -> Decimal | None:
+    match = _TITLE_MONEY_RE.search(text)
+    if not match:
+        return None
+    return parse_money(match.group(1))
 
 
 def _split_sum(splits: list[PlannedSplit]) -> Decimal:
@@ -452,6 +460,105 @@ def build_etsy_transactions(
     return tuple(transactions), tuple(warnings), tuple(sorted(mapping_keys))
 
 
+def build_etsy_deposit_match_candidates(
+    data: EtsyInputData,
+    mapping: MappingConfig,
+) -> tuple[PlannedTransaction, ...]:
+    if not mapping.etsy_clearing_guid:
+        return ()
+
+    candidates: list[PlannedTransaction] = []
+    for row in data.statement_rows:
+        if row.row_type != "Deposit":
+            continue
+        amount = row.net or row.amount or _extract_money_from_text(row.title) or ZERO
+        if amount == ZERO:
+            continue
+        description = row.title or f"Etsy Deposit {row.row_id}"
+        external_ref = row.order_id or row.row_id
+        candidates.append(
+            PlannedTransaction(
+                dedupe_key=f"etsy:deposit:{row.row_id}",
+                marketplace="etsy",
+                txn_kind="deposit_match",
+                txn_id=row.row_id,
+                date=row.date,
+                description=description,
+                external_ref=external_ref,
+                clearing_amount=amount,
+                splits=(
+                    PlannedSplit(
+                        account_guid=mapping.etsy_clearing_guid,
+                        amount=amount,
+                        memo=f"Etsy deposit {external_ref}",
+                        mapping_key="etsy:deposit-match",
+                    ),
+                    PlannedSplit(
+                        account_guid=None,
+                        amount=-amount,
+                        memo=f"Etsy deposit offset {external_ref}",
+                        mapping_key="etsy:deposit-match-offset",
+                    ),
+                ),
+                source_row_ids=(row.row_id,),
+                warnings=(),
+            )
+        )
+
+    candidates.sort(key=lambda txn: (txn.date, txn.txn_id))
+    return tuple(candidates)
+
+
+def build_etsy_payment_match_candidates(
+    data: EtsyInputData,
+    mapping: MappingConfig,
+) -> tuple[PlannedTransaction, ...]:
+    if not mapping.etsy_clearing_guid:
+        return ()
+
+    candidates: list[PlannedTransaction] = []
+    for row in data.statement_rows:
+        if row.row_type != "Payment":
+            continue
+        raw_amount = row.net or row.fees_taxes or row.amount or _extract_money_from_text(row.title) or ZERO
+        amount = -abs(raw_amount)
+        if amount == ZERO:
+            continue
+        external_ref = row.info or row.row_id
+        description = row.title or f"Etsy Payment {external_ref}"
+        candidates.append(
+            PlannedTransaction(
+                dedupe_key=f"etsy:payment:{row.row_id}",
+                marketplace="etsy",
+                txn_kind="payment_match",
+                txn_id=row.row_id,
+                date=row.date,
+                description=description,
+                external_ref=external_ref,
+                clearing_amount=amount,
+                splits=(
+                    PlannedSplit(
+                        account_guid=mapping.etsy_clearing_guid,
+                        amount=amount,
+                        memo=f"Etsy payment {external_ref}",
+                        mapping_key="etsy:payment-match",
+                    ),
+                    PlannedSplit(
+                        account_guid=None,
+                        amount=-amount,
+                        memo=f"Etsy payment offset {external_ref}",
+                        mapping_key="etsy:payment-match-offset",
+                    ),
+                ),
+                source_row_ids=(row.row_id,),
+                warnings=(),
+            )
+        )
+
+    candidates.sort(key=lambda txn: (txn.date, txn.txn_id))
+    return tuple(candidates)
+
+
 def build_ebay_transactions(
     data: EbayInputData,
     mapping: MappingConfig,
@@ -660,10 +767,60 @@ def build_ebay_transactions(
     return tuple(transactions), tuple(warnings), fee_columns
 
 
+def build_ebay_payout_match_candidates(
+    data: EbayInputData,
+    mapping: MappingConfig,
+) -> tuple[PlannedTransaction, ...]:
+    if not mapping.ebay_clearing_guid:
+        return ()
+
+    candidates: list[PlannedTransaction] = []
+    for row in data.report_rows:
+        if row.row_type != "Payout":
+            continue
+        amount = abs(row.net_amount)
+        if amount == ZERO:
+            continue
+        external_ref = row.raw.get("Payout ID") or row.raw.get("Reference ID") or row.row_id
+        description = row.description or f"eBay Payout {external_ref}"
+        candidates.append(
+            PlannedTransaction(
+                dedupe_key=f"ebay:payout:{row.row_id}",
+                marketplace="ebay",
+                txn_kind="payout_match",
+                txn_id=external_ref,
+                date=row.date,
+                description=description,
+                external_ref=external_ref,
+                clearing_amount=amount,
+                splits=(
+                    PlannedSplit(
+                        account_guid=mapping.ebay_clearing_guid,
+                        amount=amount,
+                        memo=f"eBay payout {external_ref}",
+                        mapping_key="ebay:payout-match",
+                    ),
+                    PlannedSplit(
+                        account_guid=None,
+                        amount=-amount,
+                        memo=f"eBay payout offset {external_ref}",
+                        mapping_key="ebay:payout-match-offset",
+                    ),
+                ),
+                source_row_ids=(row.row_id,),
+                warnings=(),
+            )
+        )
+
+    candidates.sort(key=lambda txn: (txn.date, txn.txn_id))
+    return tuple(candidates)
+
+
 def build_bank_transactions(
     bank_imports: tuple[tuple[BankImportSpec, tuple[BankStatementData, ...]], ...],
     mapping: MappingConfig,
     marketplace_transactions: tuple[PlannedTransaction, ...],
+    marketplace_payout_candidates: tuple[PlannedTransaction, ...] = (),
 ) -> tuple[
     tuple[PlannedTransaction, ...],
     tuple[str, ...],
@@ -718,6 +875,7 @@ def build_bank_transactions(
                     bank_date=row.date,
                     bank_amount=row.amount,
                     eligible_marketplace_transactions=eligible_marketplace_transactions,
+                    marketplace_payout_candidates=list(marketplace_payout_candidates),
                     used_marketplace_keys=used_marketplace_keys,
                     bank_description=description,
                     bank_dedupe_key=dedupe_key,
@@ -836,6 +994,7 @@ def _find_marketplace_match(
     bank_date: date,
     bank_amount: Decimal,
     eligible_marketplace_transactions: list[PlannedTransaction],
+    marketplace_payout_candidates: list[PlannedTransaction],
     used_marketplace_keys: set[str],
     bank_description: str,
     bank_dedupe_key: str,
@@ -851,6 +1010,50 @@ def _find_marketplace_match(
             bank_description=bank_description,
             bank_dedupe_key=bank_dedupe_key,
             bank_txn_id=bank_txn_id,
+        )
+
+    payout_candidates = [
+        txn
+        for txn in marketplace_payout_candidates
+        if txn.dedupe_key not in used_marketplace_keys
+        and txn.clearing_amount == bank_amount
+        and abs((bank_date - txn.date).days) <= 7
+    ]
+    payout_candidates.sort(key=lambda txn: (abs((bank_date - txn.date).days), txn.date, txn.txn_id))
+    if len(payout_candidates) == 1:
+        matched_transaction = payout_candidates[0]
+        clearing_guid = _find_clearing_account_guid(matched_transaction)
+        match_source = matched_transaction.txn_kind.replace("_match", "")
+        targets = (
+            BankMatchTarget(
+                account_guid=clearing_guid,
+                amount=-matched_transaction.clearing_amount,
+                memo=f"Matched clearing for {bank_description}",
+            ),
+        ) if clearing_guid else ()
+        return BankMatchResult(
+            bank_dedupe_key=bank_dedupe_key,
+            bank_txn_id=bank_txn_id,
+            bank_description=bank_description,
+            bank_date=bank_date,
+            bank_amount=bank_amount,
+            status="matched",
+            match_source=match_source,
+            matched_transaction_ids=(matched_transaction.dedupe_key,),
+            targets=targets,
+        )
+    if len(payout_candidates) > 1:
+        match_source = payout_candidates[0].txn_kind.replace("_match", "")
+        return BankMatchResult(
+            bank_dedupe_key=bank_dedupe_key,
+            bank_txn_id=bank_txn_id,
+            bank_description=bank_description,
+            bank_date=bank_date,
+            bank_amount=bank_amount,
+            status="ambiguous",
+            match_source=match_source,
+            matched_transaction_ids=tuple(txn.dedupe_key for txn in payout_candidates),
+            targets=(),
         )
 
     candidates = [

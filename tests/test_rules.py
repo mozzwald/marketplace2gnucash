@@ -18,6 +18,9 @@ from market2gnucash.core.rules import (
     bank_merchant_key,
     build_bank_transactions,
     build_ebay_transactions,
+    build_ebay_payout_match_candidates,
+    build_etsy_deposit_match_candidates,
+    build_etsy_payment_match_candidates,
     build_etsy_transactions,
 )
 
@@ -230,6 +233,145 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(sum(split.amount for split in transactions[0].splits), Decimal("0"))
         self.assertEqual(len(transactions[0].splits), 2)
         self.assertTrue(all(split.mapping_key != "bank:suspense" for split in transactions[0].splits))
+
+    def test_bank_rules_match_etsy_deposit_candidates_before_subset_matching(self) -> None:
+        etsy_data = parse_etsy_inputs(
+            SAMPLES / "etsy_statement_2026_2.csv",
+            SAMPLES / "EtsySoldOrders2026-2.csv",
+        )
+        deposit_candidates = build_etsy_deposit_match_candidates(etsy_data, self._etsy_mapping())
+        target = next(candidate for candidate in deposit_candidates if candidate.clearing_amount == Decimal("118.37"))
+
+        csv_text = "\n".join(
+            [
+                "Date,Description,Amount,Reference,Currency",
+                f"{target.date.month:02d}/{target.date.day:02d}/{target.date.year},ETSY INC Payout,118.37,BDEP1,USD",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "checking.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            statement = parse_bank_statement_file(path)
+
+        bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
+        marketplace_transactions = (
+            PlannedTransaction(
+                dedupe_key="etsy:sale:subset-a",
+                marketplace="etsy",
+                txn_kind="sale",
+                txn_id="subset-a",
+                date=target.date,
+                description="Subset A",
+                external_ref="subset-a",
+                clearing_amount=Decimal("100.00"),
+                splits=(
+                    PlannedSplit(account_guid="guid-asset-etsy", amount=Decimal("100.00"), memo="clearing"),
+                    PlannedSplit(account_guid="guid-income-etsy", amount=Decimal("-100.00"), memo="income"),
+                ),
+                source_row_ids=("sa",),
+            ),
+            PlannedTransaction(
+                dedupe_key="etsy:sale:subset-b",
+                marketplace="etsy",
+                txn_kind="sale",
+                txn_id="subset-b",
+                date=target.date,
+                description="Subset B",
+                external_ref="subset-b",
+                clearing_amount=Decimal("18.37"),
+                splits=(
+                    PlannedSplit(account_guid="guid-asset-etsy", amount=Decimal("18.37"), memo="clearing"),
+                    PlannedSplit(account_guid="guid-income-etsy", amount=Decimal("-18.37"), memo="income"),
+                ),
+                source_row_ids=("sb",),
+            ),
+        )
+
+        transactions, warnings, match_results, category_results = build_bank_transactions(
+            ((bank_import, (statement,)),),
+            self._bank_mapping("unused"),
+            marketplace_transactions,
+            marketplace_payout_candidates=deposit_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(match_results[0].status, "matched")
+        self.assertEqual(match_results[0].match_source, "deposit")
+        self.assertEqual(match_results[0].matched_transaction_ids, (target.dedupe_key,))
+
+    def test_bank_rules_match_sample_ebay_payout_candidate(self) -> None:
+        statement = parse_bank_statement_file(SAMPLES / "hometown.csv")
+        bank_row = next(row for row in statement.rows if row.date == date(2026, 1, 7) and row.amount == Decimal("4.78"))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "checking.csv"
+            path.write_text(
+                "\n".join(
+                    [
+                        "Date,Description,Amount",
+                        f"{bank_row.date.month:02d}/{bank_row.date.day:02d}/{bank_row.date.year},{bank_row.description},{bank_row.amount}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            mini_statement = parse_bank_statement_file(path)
+
+        ebay_data = parse_ebay_report(SAMPLES / "eBay-Transaction_report_20260101_20260131.csv")
+        payout_candidates = build_ebay_payout_match_candidates(ebay_data, self._ebay_mapping(ebay_data.fee_columns))
+        self.assertTrue(any(candidate.clearing_amount == Decimal("4.78") for candidate in payout_candidates))
+
+        bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
+        transactions, warnings, match_results, category_results = build_bank_transactions(
+            ((bank_import, (mini_statement,)),),
+            self._ebay_mapping(ebay_data.fee_columns),
+            (),
+            marketplace_payout_candidates=payout_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(match_results[0].status, "matched")
+        self.assertEqual(match_results[0].match_source, "payout")
+        self.assertTrue(match_results[0].matched_transaction_ids[0].startswith("ebay:payout:"))
+
+    def test_bank_rules_match_etsy_payment_candidates(self) -> None:
+        etsy_data = parse_etsy_inputs(
+            SAMPLES / "etsy_statement_2026_1.csv",
+            SAMPLES / "EtsySoldOrders2026-1.csv",
+        )
+        payment_candidates = build_etsy_payment_match_candidates(etsy_data, self._etsy_mapping())
+        target = next(candidate for candidate in payment_candidates if candidate.clearing_amount == Decimal("-1.00"))
+
+        csv_text = "\n".join(
+            [
+                "Date,Description,Amount,Reference,Currency",
+                f"{target.date.month:02d}/{target.date.day:02d}/{target.date.year},ETSY CARD PAYMENT,-1.00,EPAY1,USD",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "card.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            statement = parse_bank_statement_file(path)
+
+        bank_import = BankImportSpec(account_guid="guid-card-account", statement_paths=(str(path),))
+        transactions, warnings, match_results, category_results = build_bank_transactions(
+            ((bank_import, (statement,)),),
+            self._etsy_mapping(),
+            (),
+            marketplace_payout_candidates=payment_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(match_results[0].status, "matched")
+        self.assertEqual(match_results[0].match_source, "payment")
+        self.assertEqual(match_results[0].matched_transaction_ids, (target.dedupe_key,))
 
     def test_bank_rules_manual_override_is_used(self) -> None:
         csv_text = "\n".join(

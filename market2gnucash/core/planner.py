@@ -19,6 +19,9 @@ from market2gnucash.core.parsers import (
 from market2gnucash.core.rules import (
     build_bank_transactions,
     build_ebay_transactions,
+    build_ebay_payout_match_candidates,
+    build_etsy_deposit_match_candidates,
+    build_etsy_payment_match_candidates,
     build_etsy_transactions,
 )
 
@@ -60,6 +63,7 @@ def build_plan(
     ebay_fee_columns: tuple[str, ...] = ()
     bank_match_results = ()
     bank_category_results = ()
+    marketplace_payout_candidates = ()
 
     if etsy_statement_path or etsy_sold_orders_path:
         if not (etsy_statement_path and etsy_sold_orders_path):
@@ -72,12 +76,21 @@ def build_plan(
             end_date=end_date,
         )
         etsy_txns, etsy_warnings, etsy_mapping_keys = build_etsy_transactions(etsy_data, mapping)
+        marketplace_payout_candidates = tuple(
+            [
+                *build_etsy_deposit_match_candidates(etsy_data, mapping),
+                *build_etsy_payment_match_candidates(etsy_data, mapping),
+            ]
+        )
         all_transactions.extend(etsy_txns)
         all_warnings.extend(etsy_warnings)
 
     if ebay_report_path:
         ebay_data = parse_ebay_report(ebay_report_path, start_date=start_date, end_date=end_date)
         ebay_txns, ebay_warnings, ebay_fee_columns = build_ebay_transactions(ebay_data, mapping)
+        marketplace_payout_candidates = tuple(
+            [*marketplace_payout_candidates, *build_ebay_payout_match_candidates(ebay_data, mapping)]
+        )
         all_transactions.extend(ebay_txns)
         all_warnings.extend(ebay_warnings)
 
@@ -119,6 +132,7 @@ def build_plan(
             tuple(parsed_bank_imports),
             mapping,
             tuple(txn for txn in all_transactions if txn.marketplace in {"etsy", "ebay"}),
+            marketplace_payout_candidates=marketplace_payout_candidates,
         )
         all_transactions.extend(bank_txns)
         all_warnings.extend(bank_warnings)

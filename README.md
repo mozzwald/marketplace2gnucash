@@ -118,6 +118,38 @@ or:
 python -m market2gnucash.app
 ```
 
+## Standalone Build
+
+The project is set up for a PyInstaller `onedir` build.
+
+Prerequisites:
+
+1. Build with a Python interpreter that can already import `gnucash`.
+2. Install build dependencies:
+
+```bash
+pip install -e ".[build]"
+```
+
+Build command:
+
+```bash
+python tools/build_standalone.py --clean
+```
+
+Output:
+
+- App bundle directory: `dist/market2gnucash/`
+- Executable:
+  - Linux/macOS: `dist/market2gnucash/market2gnucash`
+  - Windows: `dist/market2gnucash/market2gnucash.exe`
+
+Notes:
+
+- This is a `onedir` bundle, not a single-file executable. That is intentional because PySide6 and GnuCash bindings are less brittle in directory form.
+- The build helper fails fast if `PyInstaller` or `gnucash` are not importable in the build environment.
+- The PyInstaller spec file is `market2gnucash.spec`.
+
 ## Safe Usage Checklist
 
 1. Close GnuCash before importing.

@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -41,17 +42,36 @@ class MatchOverrideDialog(QDialog):
         layout.addWidget(QLabel(f"Bank/Card transaction: {bank_description}"))
         layout.addWidget(QLabel(f"Target amount: {bank_amount}"))
 
-        self.list_widget = QListWidget()
-        for status_row in candidates:
+        self.candidates_table = QTableWidget()
+        self.candidates_table.setColumnCount(6)
+        self.candidates_table.setHorizontalHeaderLabels(
+            ["Date", "Marketplace", "Type", "ID", "Amount", "Status"]
+        )
+        self.candidates_table.setRowCount(len(candidates))
+        self.candidates_table.verticalHeader().setVisible(False)
+        self.candidates_table.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.candidates_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.candidates_table.setSortingEnabled(False)
+
+        for row_index, status_row in enumerate(candidates):
             txn = status_row.transaction
-            item = QListWidgetItem(
-                f"{txn.date.isoformat()} | {txn.marketplace} | {txn.txn_kind} | {txn.txn_id} | {txn.clearing_amount} | {status_row.status}"
-            )
-            item.setData(32, txn.dedupe_key)
-            item.setSelected(txn.dedupe_key in selected_ids)
-            self.list_widget.addItem(item)
-        self.list_widget.setSelectionMode(QListWidget.MultiSelection)
-        layout.addWidget(self.list_widget)
+            row_items = [
+                QTableWidgetItem(txn.date.isoformat()),
+                QTableWidgetItem(txn.marketplace),
+                QTableWidgetItem(txn.txn_kind),
+                QTableWidgetItem(txn.txn_id),
+                QTableWidgetItem(str(txn.clearing_amount)),
+                QTableWidgetItem(status_row.status),
+            ]
+            row_items[0].setData(Qt.ItemDataRole.UserRole, txn.dedupe_key)
+            for col_index, item in enumerate(row_items):
+                self.candidates_table.setItem(row_index, col_index, item)
+            if txn.dedupe_key in selected_ids:
+                self.candidates_table.selectRow(row_index)
+
+        self.candidates_table.setSortingEnabled(True)
+        self.candidates_table.resizeColumnsToContents()
+        layout.addWidget(self.candidates_table)
 
         buttons_row = QHBoxLayout()
         save_button = QPushButton("Save Override")
@@ -64,9 +84,16 @@ class MatchOverrideDialog(QDialog):
         layout.addLayout(buttons_row)
 
     def selected_dedupe_keys(self) -> tuple[str, ...]:
-        keys = []
-        for item in self.list_widget.selectedItems():
-            dedupe_key = item.data(32)
+        keys: list[str] = []
+        seen_rows: set[int] = set()
+        for item in self.candidates_table.selectedItems():
+            if item.row() in seen_rows:
+                continue
+            seen_rows.add(item.row())
+            dedupe_item = self.candidates_table.item(item.row(), 0)
+            if dedupe_item is None:
+                continue
+            dedupe_key = dedupe_item.data(Qt.ItemDataRole.UserRole)
             if isinstance(dedupe_key, str):
                 keys.append(dedupe_key)
         return tuple(keys)
@@ -86,106 +113,188 @@ class BankMappingTab(QWidget):
         tools_row.addStretch()
         layout.addLayout(tools_row)
 
-        self.match_table = QTableWidget()
-        self.match_table.setColumnCount(7)
-        self.match_table.setHorizontalHeaderLabels(
-            ["Status", "Source", "Date", "Bank/Card Transaction", "Amount", "Matched Marketplace Txns", "Actions"]
+        self.txn_table = QTableWidget()
+        self.txn_table.setColumnCount(8)
+        self.txn_table.setHorizontalHeaderLabels(
+            ["Date", "Bank Acct", "Description", "Amount", "Marketplace Txns", "Account", "Actions", "Rule"]
         )
-        self.match_table.verticalHeader().setVisible(False)
-        layout.addWidget(QLabel("Bank / Card Matching"))
-        layout.addWidget(self.match_table)
-
-        self.bank_category_table = QTableWidget()
-        self.bank_category_table.setColumnCount(7)
-        self.bank_category_table.setHorizontalHeaderLabels(
-            ["Source", "Merchant Rule", "Date", "Description", "Amount", "Account", "Actions"]
-        )
-        self.bank_category_table.verticalHeader().setVisible(False)
-        layout.addWidget(QLabel("Bank / Card Counterparty Mapping"))
-        layout.addWidget(self.bank_category_table)
+        self.txn_table.verticalHeader().setVisible(False)
+        self.txn_table.setSortingEnabled(True)
+        layout.addWidget(QLabel("Bank / Card Transactions"))
+        layout.addWidget(self.txn_table)
 
     def refresh_from_state(self) -> None:
         plan = self.app_state.get("plan_result")
         if plan is None:
-            self._populate_match_table(())
-            self._populate_bank_category_table((), self.app_state.get("mapping_config", MappingConfig()))
+            self._populate_transaction_table((), (), self.app_state.get("mapping_config", MappingConfig()))
             return
 
         mapping: MappingConfig = self.app_state.get("mapping_config", MappingConfig())
-        self._populate_match_table(plan.bank_match_results)
-        self._populate_bank_category_table(plan.bank_category_results, mapping)
+        self._populate_transaction_table(
+            plan.bank_match_results,
+            plan.bank_category_results,
+            mapping,
+            plan.transactions,
+        )
 
-    def _populate_match_table(self, match_results: tuple) -> None:
-        self.match_table.setRowCount(len(match_results))
+    def _populate_transaction_table(
+        self,
+        match_results: tuple,
+        category_results: tuple,
+        mapping: MappingConfig,
+        planned_transactions: tuple[PlannedTransactionStatus, ...] = (),
+    ) -> None:
+        self.txn_table.setSortingEnabled(False)
+        self.txn_table.setRowCount(len(match_results))
+        accounts_by_guid = self.app_state.get("accounts_by_guid", {})
+        category_by_key = {result.bank_dedupe_key: result for result in category_results}
+        bank_account_by_key: dict[str, str] = {}
+        for status_row in planned_transactions:
+            txn = status_row.transaction
+            if txn.marketplace != "bank":
+                continue
+            bank_split = next((split for split in txn.splits if split.mapping_key == "bank:account"), None)
+            if bank_split is None or not bank_split.account_guid:
+                continue
+            account = accounts_by_guid.get(bank_split.account_guid)
+            if account is None:
+                continue
+            bank_account_by_key[txn.dedupe_key] = account.full_name.split(":")[-1]
+
         for row_index, match_result in enumerate(match_results):
-            matched_ids = "\n".join(match_result.matched_transaction_ids) if match_result.matched_transaction_ids else "(none)"
-            self.match_table.setItem(row_index, 0, QTableWidgetItem(match_result.status))
-            self.match_table.setItem(row_index, 1, QTableWidgetItem(match_result.match_source))
-            self.match_table.setItem(row_index, 2, QTableWidgetItem(match_result.bank_date.isoformat()))
-            self.match_table.setItem(row_index, 3, QTableWidgetItem(match_result.bank_description))
-            self.match_table.setItem(row_index, 4, QTableWidgetItem(str(match_result.bank_amount)))
-            self.match_table.setItem(row_index, 5, QTableWidgetItem(matched_ids))
+            category_result = category_by_key.get(match_result.bank_dedupe_key)
+            bank_account_label = bank_account_by_key.get(match_result.bank_dedupe_key, "(unmapped)")
+            matched_account_labels = []
+            for target in match_result.targets:
+                account = accounts_by_guid.get(target.account_guid)
+                matched_account_labels.append(account.full_name if account else target.account_guid)
+            if matched_account_labels:
+                account_label = "\n".join(matched_account_labels)
+                mapped = True
+            else:
+                account_guid = category_result.mapped_account_guid if category_result else None
+                account = accounts_by_guid.get(account_guid) if account_guid else None
+                account_label = account.full_name if account else "(unmapped)"
+                mapped = account is not None
+            merchant_rule = category_result.merchant_key if category_result else ""
+            matched_ids = (
+                "\n".join(self._format_match_label(value) for value in match_result.matched_transaction_ids)
+                if match_result.matched_transaction_ids
+                else "(unmatched)"
+            )
+            matched = match_result.status == "matched"
+
+            row_items = [
+                QTableWidgetItem(match_result.bank_date.isoformat()),
+                QTableWidgetItem(bank_account_label),
+                QTableWidgetItem(match_result.bank_description),
+                QTableWidgetItem(str(match_result.bank_amount)),
+                QTableWidgetItem(matched_ids),
+                QTableWidgetItem(account_label),
+                QTableWidgetItem(""),
+                QTableWidgetItem(merchant_rule),
+            ]
+            for col_index, item in enumerate(row_items):
+                self.txn_table.setItem(row_index, col_index, item)
 
             actions_widget = QWidget()
             actions_layout = QHBoxLayout(actions_widget)
             actions_layout.setContentsMargins(0, 0, 0, 0)
-            override_button = QPushButton("Override")
-            override_button.clicked.connect(
+            match_button = QPushButton("Marketplace Match")
+            match_button.clicked.connect(
                 lambda _checked=False, dedupe_key=match_result.bank_dedupe_key: self._edit_match_override(dedupe_key)
             )
-            clear_button = QPushButton("Clear")
-            clear_button.clicked.connect(
+            clear_match_button = QPushButton("Clear Match")
+            clear_match_button.clicked.connect(
                 lambda _checked=False, dedupe_key=match_result.bank_dedupe_key: self._clear_match_override(dedupe_key)
             )
-            actions_layout.addWidget(override_button)
-            actions_layout.addWidget(clear_button)
+            actions_layout.addWidget(match_button)
+            actions_layout.addWidget(clear_match_button)
+
+            if category_result is not None:
+                default_button = QPushButton("Use Default")
+                default_button.clicked.connect(
+                    lambda _checked=False, key=category_result.merchant_key: self._pick_bank_category_default_account(key)
+                )
+                account_button = QPushButton("Account")
+                account_button.clicked.connect(
+                    lambda _checked=False, dedupe_key=category_result.bank_dedupe_key: self._pick_bank_category_transaction_account(dedupe_key)
+                )
+                clear_account_button = QPushButton("Clear Account")
+                clear_account_button.clicked.connect(
+                    lambda _checked=False,
+                    dedupe_key=category_result.bank_dedupe_key,
+                    key=category_result.merchant_key: self._clear_bank_category_mapping(dedupe_key, key)
+                )
+                actions_layout.addWidget(default_button)
+                actions_layout.addWidget(account_button)
+                actions_layout.addWidget(clear_account_button)
             actions_layout.addStretch()
-            self.match_table.setCellWidget(row_index, 6, actions_widget)
+            self.txn_table.setCellWidget(row_index, 6, actions_widget)
+            self._apply_row_colors(row_index, matched=matched, mapped=mapped, actions_widget=actions_widget)
 
-        self.match_table.resizeColumnsToContents()
+        self.txn_table.setSortingEnabled(True)
+        self.txn_table.resizeColumnsToContents()
 
-    def _populate_bank_category_table(self, category_results: tuple, mapping: MappingConfig) -> None:
-        self.bank_category_table.setRowCount(len(category_results))
-        accounts_by_guid = self.app_state.get("accounts_by_guid", {})
-        for row_index, category_result in enumerate(category_results):
-            account = (
-                accounts_by_guid.get(category_result.mapped_account_guid)
-                if category_result.mapped_account_guid
-                else None
-            )
-            account_label = account.full_name if account else "(unmapped)"
+    @staticmethod
+    def _format_match_label(dedupe_key: str) -> str:
+        parts = dedupe_key.split(":")
+        if len(parts) >= 2:
+            return f"{parts[0]}:{parts[1]}"
+        return dedupe_key
 
-            self.bank_category_table.setItem(row_index, 0, QTableWidgetItem(category_result.mapping_source))
-            self.bank_category_table.setItem(row_index, 1, QTableWidgetItem(category_result.merchant_key))
-            self.bank_category_table.setItem(row_index, 2, QTableWidgetItem(category_result.txn_date.isoformat()))
-            self.bank_category_table.setItem(row_index, 3, QTableWidgetItem(category_result.description))
-            self.bank_category_table.setItem(row_index, 4, QTableWidgetItem(str(category_result.amount)))
-            self.bank_category_table.setItem(row_index, 5, QTableWidgetItem(account_label))
+    def _apply_row_colors(
+        self,
+        row_index: int,
+        *,
+        matched: bool,
+        mapped: bool,
+        actions_widget: QWidget,
+    ) -> None:
+        green = QColor("#93FA8F")
+        yellow = QColor("#F8DF63")
+        black = QColor("black")
 
-            actions_widget = QWidget()
-            actions_layout = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(0, 0, 0, 0)
-            default_button = QPushButton("Default")
-            default_button.clicked.connect(
-                lambda _checked=False, key=category_result.merchant_key: self._pick_bank_category_default_account(key)
-            )
-            override_button = QPushButton("Override")
-            override_button.clicked.connect(
-                lambda _checked=False, dedupe_key=category_result.bank_dedupe_key: self._pick_bank_category_transaction_account(dedupe_key)
-            )
-            clear_button = QPushButton("Clear")
-            clear_button.clicked.connect(
-                lambda _checked=False,
-                dedupe_key=category_result.bank_dedupe_key,
-                key=category_result.merchant_key: self._clear_bank_category_mapping(dedupe_key, key)
-            )
-            actions_layout.addWidget(default_button)
-            actions_layout.addWidget(override_button)
-            actions_layout.addWidget(clear_button)
-            actions_layout.addStretch()
-            self.bank_category_table.setCellWidget(row_index, 6, actions_widget)
+        def style_actions(background: str) -> None:
+            actions_widget.setStyleSheet(f"background-color: {background}; color: black;")
+            for button in actions_widget.findChildren(QPushButton):
+                button.setStyleSheet(f"background-color: {background}; color: black;")
 
-        self.bank_category_table.resizeColumnsToContents()
+        if matched and mapped:
+            for col in range(8):
+                item = self.txn_table.item(row_index, col)
+                if item is None:
+                    continue
+                item.setBackground(green)
+                item.setForeground(black)
+            style_actions("#93FA8F")
+            return
+
+        if matched and not mapped:
+            for col in range(8):
+                item = self.txn_table.item(row_index, col)
+                if item is None:
+                    continue
+                item.setBackground(yellow)
+                item.setForeground(black)
+            style_actions("#F8DF63")
+            return
+
+        if mapped and not matched:
+            for col in range(8):
+                item = self.txn_table.item(row_index, col)
+                if item is None:
+                    continue
+                item.setBackground(yellow if col == 4 else green)
+                item.setForeground(black)
+            style_actions("#93FA8F")
+            return
+
+        if not matched:
+            item = self.txn_table.item(row_index, 4)
+            if item is not None:
+                item.setBackground(yellow)
+                item.setForeground(black)
 
     def _marketplace_candidate_rows(self) -> list[PlannedTransactionStatus]:
         plan = self.app_state.get("plan_result")

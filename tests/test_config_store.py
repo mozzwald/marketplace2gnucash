@@ -73,6 +73,23 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(loaded.marketplace_accounts["etsy:shop-a"].account_label, "Etsy Shop A")
             self.assertEqual(loaded.marketplace_accounts["etsy:shop-a"].fee_accounts["etsy:Fee:Listing fee"], "guid-fee")
 
+    def test_bank_transfer_overrides_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(path)
+
+            mapping = MappingConfig(
+                bank_transfer_overrides={
+                    "bank:checking:T1": "bank:visa:T2",
+                    "bank:visa:T2": "bank:checking:T1",
+                }
+            )
+            store.save_mapping("book-a", mapping)
+
+            loaded = store.load_mapping("book-a")
+            self.assertEqual(loaded.bank_transfer_overrides["bank:checking:T1"], "bank:visa:T2")
+            self.assertEqual(loaded.bank_transfer_overrides["bank:visa:T2"], "bank:checking:T1")
+
 
 if __name__ == "__main__":
     unittest.main()

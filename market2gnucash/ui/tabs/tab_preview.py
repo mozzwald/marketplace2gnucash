@@ -31,9 +31,9 @@ class PreviewTab(QWidget):
         self.status_label = QLabel("No preview generated.")
 
         self.txn_table = QTableWidget()
-        self.txn_table.setColumnCount(8)
+        self.txn_table.setColumnCount(9)
         self.txn_table.setHorizontalHeaderLabels(
-            ["Date", "Market", "Market Acct", "Kind", "ID", "Net", "Status", "Reason"]
+            ["Date", "Market", "Market Acct", "Kind", "ID", "Memo", "Net", "Status", "Reason"]
         )
         self.txn_table.verticalHeader().setVisible(False)
         self.txn_table.setSortingEnabled(True)
@@ -83,6 +83,7 @@ class PreviewTab(QWidget):
             plan = build_plan(
                 book_id=book_id,
                 dedupe_store=self.app_state["dedupe_store"],
+                carryover_store=self.app_state["carryover_store"],
                 mapping=self.app_state["mapping_config"],
                 marketplace_imports=marketplace_imports,
                 bank_imports=bank_imports,
@@ -101,21 +102,35 @@ class PreviewTab(QWidget):
         total = len(plan.transactions)
         ready = sum(1 for row in plan.transactions if row.status == "ready")
         duplicate = sum(1 for row in plan.transactions if row.status == "duplicate")
+        deferred = sum(1 for row in plan.transactions if row.status == "deferred")
+        counterpart = sum(1 for row in plan.transactions if row.status == "counterpart")
         blocked = sum(1 for row in plan.transactions if row.status == "blocked")
         self.status_label.setText(
-            f"Planned transactions: {total} | Ready: {ready} | Duplicate: {duplicate} | Blocked: {blocked}"
+            f"Planned transactions: {total} | Ready: {ready} | Duplicate: {duplicate} | Deferred: {deferred} | Counterpart: {counterpart} | Blocked: {blocked} | Carryover Pending: {plan.pending_carryover_count}"
         )
 
         self.txn_table.setSortingEnabled(False)
         self.txn_table.setRowCount(total)
+        accounts_by_guid = self.app_state.get("accounts_by_guid", {})
         for row_index, status_row in enumerate(plan.transactions):
             txn = status_row.transaction
+            market_account_label = txn.marketplace_account_label or ""
+            if txn.marketplace == "bank":
+                bank_split = next(
+                    (split for split in txn.splits if split.mapping_key == "bank:account" and split.account_guid),
+                    None,
+                )
+                if bank_split is not None and bank_split.account_guid:
+                    account = accounts_by_guid.get(bank_split.account_guid)
+                    if account is not None:
+                        market_account_label = account.full_name.split(":")[-1]
             values = [
                 txn.date.isoformat(),
                 txn.marketplace,
-                txn.marketplace_account_label or "",
+                market_account_label,
                 txn.txn_kind,
                 txn.txn_id,
+                txn.description,
                 str(txn.clearing_amount),
                 status_row.status,
                 status_row.status_reason,

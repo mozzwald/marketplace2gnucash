@@ -29,11 +29,15 @@ class SettingsTab(QWidget):
         self.db_path_label = QLabel()
         self.book_count_label = QLabel()
         self.import_count_label = QLabel()
+        self.carryover_count_label = QLabel()
+        self.transfer_anchor_count_label = QLabel()
         paths_layout.addRow("Data directory", self.data_dir_label)
         paths_layout.addRow("Config file", self.config_path_label)
         paths_layout.addRow("Import history DB", self.db_path_label)
         paths_layout.addRow("Saved books", self.book_count_label)
         paths_layout.addRow("Imported rows", self.import_count_label)
+        paths_layout.addRow("Pending carryover", self.carryover_count_label)
+        paths_layout.addRow("Pending transfer anchors", self.transfer_anchor_count_label)
         layout.addWidget(paths_group)
 
         actions_group = QGroupBox("Actions")
@@ -58,6 +62,16 @@ class SettingsTab(QWidget):
         )
         clear_history_row.addStretch()
         actions_layout.addLayout(clear_history_row)
+
+        clear_carryover_row = QHBoxLayout()
+        clear_carryover_button = QPushButton("Clear Carryover Queue")
+        clear_carryover_button.clicked.connect(self._clear_carryover_queue)
+        clear_carryover_row.addWidget(clear_carryover_button)
+        clear_carryover_row.addWidget(
+            QLabel("Remove unresolved marketplace carryover candidates saved for future matching.")
+        )
+        clear_carryover_row.addStretch()
+        actions_layout.addLayout(clear_carryover_row)
 
         reset_all_row = QHBoxLayout()
         reset_all_button = QPushButton("Reset All Saved App Settings")
@@ -93,11 +107,14 @@ class SettingsTab(QWidget):
     def refresh_from_state(self) -> None:
         config_store = self.app_state["config_store"]
         dedupe_store = self.app_state["dedupe_store"]
+        carryover_store = self.app_state["carryover_store"]
         self.data_dir_label.setText(str(app_data_dir()))
         self.config_path_label.setText(str(config_json_path()))
         self.db_path_label.setText(str(dedupe_db_path()))
         self.book_count_label.setText(str(len(config_store.book_ids())))
         self.import_count_label.setText(str(dedupe_store.import_count()))
+        self.carryover_count_label.setText(str(carryover_store.pending_count()))
+        self.transfer_anchor_count_label.setText(str(dedupe_store.transfer_anchor_count()))
 
     def _reset_runtime_state(self) -> None:
         self.app_state["mapping_config"] = MappingConfig()
@@ -120,6 +137,17 @@ class SettingsTab(QWidget):
         self.app_state["plan_result"] = None
         self.app_state["notify_state_changed"]()
 
+    def _clear_carryover_queue(self) -> None:
+        if not self._confirm(
+            "Clear Carryover Queue",
+            "Delete all pending marketplace carryover candidates from the app database?",
+        ):
+            return
+
+        self.app_state["carryover_store"].clear_all()
+        self.app_state["plan_result"] = None
+        self.app_state["notify_state_changed"]()
+
     def _reset_current_book_settings(self) -> None:
         book_id = self.app_state.get("book_id")
         if not book_id:
@@ -132,6 +160,8 @@ class SettingsTab(QWidget):
             return
 
         self.app_state["config_store"].clear_book_state(book_id)
+        self.app_state["carryover_store"].clear_book(book_id)
+        self.app_state["dedupe_store"].clear_transfer_anchors(book_id)
         self._reset_runtime_state()
         self.app_state["notify_state_changed"]()
 
@@ -143,5 +173,7 @@ class SettingsTab(QWidget):
             return
 
         self.app_state["config_store"].clear_all()
+        self.app_state["carryover_store"].clear_all()
+        self.app_state["dedupe_store"].clear_transfer_anchors()
         self._reset_runtime_state()
         self.app_state["notify_state_changed"]()

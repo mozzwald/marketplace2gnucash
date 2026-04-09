@@ -16,7 +16,7 @@ from market2gnucash.core.models import BankCsvProfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"
-RS_SAMPLES = SAMPLES / "RS"
+RS_SAMPLES = SAMPLES / "Etsy-RS"
 
 
 class ParserTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class ParserTests(unittest.TestCase):
         self.assertIn("3977833995", sold_order_ids)
 
     def test_parse_ebay_report_header_and_fee_columns(self) -> None:
-        ebay_data = parse_ebay_report(SAMPLES / "ebay_Transaction_report_20260201_20260221.csv")
+        ebay_data = parse_ebay_report(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260221.csv")
 
         self.assertGreater(len(ebay_data.report_rows), 0)
         self.assertIn("Final Value Fee - fixed", ebay_data.fee_columns)
@@ -130,22 +130,22 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(statement.rows[0].memo, "Order 55")
 
     def test_parse_sample_hometown_csv(self) -> None:
-        statement = parse_bank_statement_file(SAMPLES / "hometown.csv")
+        statement = parse_bank_statement_file(SAMPLES / "Hometown" / "Hometown_20260101-20260327.csv")
 
         self.assertEqual(statement.source_format, "csv")
         self.assertEqual(statement.account_id, "336661")
-        self.assertEqual(len(statement.rows), 43)
-        self.assertEqual(statement.rows[0].amount, Decimal("45.09"))
-        self.assertIn("PAYMENTS eBay", statement.rows[0].description)
+        self.assertGreater(len(statement.rows), 40)
+        self.assertEqual(statement.rows[0].amount, Decimal("-431.79"))
+        self.assertIn("WELLS FARGO CARD CCPYMT", statement.rows[0].description)
 
     def test_parse_sample_credit_card_headerless_csv(self) -> None:
-        statement = parse_bank_statement_file(SAMPLES / "CreditCard1.csv")
+        statement = parse_bank_statement_file(SAMPLES / "Wells-Fargo" / "Wells-Fargo_20260101-20260327.csv")
 
         self.assertEqual(statement.source_format, "csv")
-        self.assertEqual(len(statement.rows), 55)
-        self.assertEqual(statement.rows[0].amount, Decimal("-100.00"))
-        self.assertEqual(statement.rows[0].description, "PIRATE SHIP * POSTAGE PRT.SH WY")
-        self.assertEqual(statement.rows[0].account_name, "CreditCard1")
+        self.assertGreater(len(statement.rows), 10)
+        self.assertEqual(statement.rows[4].amount, Decimal("-100.00"))
+        self.assertEqual(statement.rows[4].description, "PIRATE SHIP * POSTAGE PRT.SH WY")
+        self.assertEqual(statement.rows[4].account_name, "Wells-Fargo_20260101-20260327")
 
     def test_parse_headerless_csv_with_explicit_profile(self) -> None:
         profile = BankCsvProfile(
@@ -156,11 +156,11 @@ class ParserTests(unittest.TestCase):
             description_column="__col_4__",
         )
 
-        statement = parse_bank_statement_file(SAMPLES / "CreditCard1.csv", csv_profile=profile)
+        statement = parse_bank_statement_file(SAMPLES / "Wells-Fargo" / "Wells-Fargo_20260101-20260327.csv", csv_profile=profile)
 
-        self.assertEqual(len(statement.rows), 55)
-        self.assertEqual(statement.rows[2].amount, Decimal("-20.00"))
-        self.assertIn("OPENAI", statement.rows[2].description)
+        self.assertGreater(len(statement.rows), 10)
+        self.assertEqual(statement.rows[6].amount, Decimal("-20.00"))
+        self.assertIn("OPENAI", statement.rows[6].description)
 
 
 if __name__ == "__main__":

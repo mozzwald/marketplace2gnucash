@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Mapping
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -161,6 +161,7 @@ class CsvPreviewData:
 class MappingConfig:
     marketplace_accounts: Mapping[str, "MarketplaceAccountMapping"] = field(default_factory=dict)
     bank_match_overrides: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    bank_transfer_overrides: Mapping[str, str] = field(default_factory=dict)
     bank_merchant_accounts: Mapping[str, str] = field(default_factory=dict)
     bank_txn_account_overrides: Mapping[str, str] = field(default_factory=dict)
 
@@ -244,9 +245,64 @@ class BankCategoryResult:
 
 
 @dataclass(frozen=True)
+class BankTransferResult:
+    bank_dedupe_key: str
+    bank_txn_id: str
+    bank_description: str
+    bank_date: date
+    bank_amount: Decimal
+    bank_account_guid: str | None
+    bank_account_label: str
+    status: str
+    match_source: str
+    counterpart_dedupe_key: str | None
+    counterpart_txn_id: str | None
+    counterpart_account_guid: str | None
+    counterpart_account_label: str | None
+
+
+@dataclass(frozen=True)
+class TransferAnchor:
+    anchor_dedupe_key: str
+    bank_txn_id: str
+    txn_date: date
+    amount: Decimal
+    source_account_guid: str
+    source_account_label: str
+    destination_account_guid: str
+    destination_account_label: str
+    description: str
+    external_ref: str
+    anchor_source: str
+
+
+@dataclass(frozen=True)
+class TransferAnchorResolution:
+    anchor_dedupe_key: str
+    counterpart_dedupe_key: str
+
+
+@dataclass(frozen=True)
+class CarryoverCandidate:
+    candidate_key: str
+    candidate_type: str
+    source_scope: str
+    txn_date: date
+    amount: Decimal
+    description: str
+    payload: Mapping[str, Any]
+    transaction: PlannedTransaction
+
+
+@dataclass(frozen=True)
 class PlanResult:
     transactions: tuple[PlannedTransactionStatus, ...]
     warnings: tuple[str, ...]
     marketplace_mapping_keys: Mapping[str, tuple[str, ...]]
     bank_match_results: tuple[BankMatchResult, ...]
+    bank_transfer_results: tuple[BankTransferResult, ...]
     bank_category_results: tuple[BankCategoryResult, ...]
+    transfer_anchor_candidates: tuple[TransferAnchor, ...] = ()
+    matched_transfer_anchor_resolutions: tuple[TransferAnchorResolution, ...] = ()
+    matched_carryover_candidate_keys: tuple[str, ...] = ()
+    pending_carryover_count: int = 0

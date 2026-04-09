@@ -107,6 +107,11 @@ class ConfigStore:
                 for key, value in dict(mappings.get("bank_match_overrides", {})).items()
                 if isinstance(value, (list, tuple))
             },
+            bank_transfer_overrides={
+                key: value
+                for key, value in dict(mappings.get("bank_transfer_overrides", {})).items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
             bank_merchant_accounts=dict(mappings.get("bank_merchant_accounts", {})),
             bank_txn_account_overrides=dict(mappings.get("bank_txn_account_overrides", {})),
         )

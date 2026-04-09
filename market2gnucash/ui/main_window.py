@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
+from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.config_store import ConfigStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import MappingConfig
@@ -51,6 +52,7 @@ class MainWindow(QMainWindow):
             "marketplace_mapping_keys": {},
             "config_store": ConfigStore(),
             "dedupe_store": DedupeStore(),
+            "carryover_store": CarryoverStore(),
             "notify_state_changed": self._notify_tabs,
         }
 

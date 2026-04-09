@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 
+from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import (
+    AccountRecord,
     BankImportSpec,
     BankStatementData,
     BankCsvProfile,
+    CarryoverCandidate,
     MappingConfig,
     MarketplaceImportSpec,
     PlanResult,
+    PlannedTransaction,
     PlannedTransactionStatus,
+    TransferAnchor,
+    TransferAnchorResolution,
 )
 from market2gnucash.core.parsers import (
     parse_bank_statement_files,
@@ -19,6 +26,7 @@ from market2gnucash.core.parsers import (
 )
 from market2gnucash.core.rules import (
     build_bank_transactions,
+    build_ebay_charge_match_candidates,
     build_ebay_transactions,
     build_ebay_payout_match_candidates,
     build_etsy_deposit_match_candidates,
@@ -29,10 +37,11 @@ from market2gnucash.core.rules import (
 
 
 def _status_for_transaction(warnings: tuple[str, ...], is_duplicate: bool) -> tuple[str, str]:
-    if is_duplicate:
-        return "duplicate", "Already imported"
-
     for warning in warnings:
+        if warning.startswith("IMPORTED_TRANSFER_COUNTERPART"):
+            return "counterpart", "Matched to previously imported transfer"
+        if warning.startswith("TRANSFER_COUNTERPART"):
+            return "deferred", "Matched as internal transfer counterpart"
         if warning.startswith("MISSING_ACCOUNT"):
             return "blocked", "Missing required account selection"
         if warning.startswith("UNMAPPED"):
@@ -43,14 +52,53 @@ def _status_for_transaction(warnings: tuple[str, ...], is_duplicate: bool) -> tu
             return "blocked", "Ambiguous bank/card match"
         if warning.startswith("MATCH_OVERRIDE_INVALID"):
             return "blocked", "Invalid bank/card match override"
+        if warning.startswith("TRANSFER_AMBIGUOUS"):
+            return "blocked", "Ambiguous bank/card transfer match"
+        if warning.startswith("TRANSFER_OVERRIDE_INVALID"):
+            return "blocked", "Invalid bank/card transfer override"
+
+    if is_duplicate:
+        return "duplicate", "Already imported"
 
     return "ready", "Ready"
+
+
+def _carryover_key_for_candidate(transaction: PlannedTransaction) -> str:
+    parts = transaction.dedupe_key.split(":")
+    if len(parts) >= 2:
+        return ":".join([parts[0], parts[1], "carry", *parts[2:]])
+    return f"carry:{transaction.dedupe_key}"
+
+
+def _is_carryover_key(dedupe_key: str) -> bool:
+    return ":carry:" in dedupe_key or dedupe_key.startswith("carry:")
+
+
+def _carryover_candidate_from_transaction(transaction: PlannedTransaction) -> CarryoverCandidate:
+    candidate_key = _carryover_key_for_candidate(transaction)
+    carried_transaction = replace(transaction, dedupe_key=candidate_key)
+    candidate_type = transaction.txn_kind.replace("_match", "")
+    source_scope = transaction.marketplace_account_key or transaction.marketplace
+    payload = {
+        "transaction": CarryoverStore.serialize_transaction(carried_transaction),
+    }
+    return CarryoverCandidate(
+        candidate_key=candidate_key,
+        candidate_type=candidate_type,
+        source_scope=source_scope,
+        txn_date=transaction.date,
+        amount=transaction.clearing_amount,
+        description=transaction.description,
+        payload=payload,
+        transaction=carried_transaction,
+    )
 
 
 def build_plan(
     *,
     book_id: str,
     dedupe_store: DedupeStore,
+    carryover_store: CarryoverStore,
     mapping: MappingConfig,
     marketplace_imports: list[dict[str, object]] | tuple[dict[str, object], ...] | None,
     bank_imports: list[dict[str, object]] | tuple[dict[str, object], ...] | None,
@@ -61,8 +109,13 @@ def build_plan(
     all_warnings: list[str] = []
     marketplace_mapping_keys: dict[str, tuple[str, ...]] = {}
     bank_match_results = ()
+    bank_transfer_results = ()
     bank_category_results = ()
+    bank_txns = ()
     marketplace_payout_candidates = ()
+    transfer_anchor_candidates: tuple[TransferAnchor, ...] = ()
+    matched_transfer_anchor_resolutions: tuple[TransferAnchorResolution, ...] = ()
+    matched_carryover_candidate_keys: tuple[str, ...] = ()
 
     normalized_marketplace_imports: list[MarketplaceImportSpec] = []
     for raw_import in marketplace_imports or ():
@@ -152,12 +205,38 @@ def build_plan(
                         account_key=marketplace_import.account_key,
                         account_label=marketplace_import.account_label,
                     ),
+                    *build_ebay_charge_match_candidates(
+                        ebay_data,
+                        mapping,
+                        account_key=marketplace_import.account_key,
+                        account_label=marketplace_import.account_label,
+                    ),
                 ]
             )
             all_transactions.extend(ebay_txns)
             all_warnings.extend(
                 f"[{marketplace_import.account_label}] {warning}" for warning in ebay_warnings
             )
+
+    current_carryover_candidates = tuple(
+        _carryover_candidate_from_transaction(transaction)
+        for transaction in marketplace_payout_candidates
+    )
+    current_carryover_by_key = {
+        candidate.candidate_key: candidate for candidate in current_carryover_candidates
+    }
+    current_candidate_resolution_keys = {
+        transaction.dedupe_key: candidate.candidate_key
+        for transaction, candidate in zip(marketplace_payout_candidates, current_carryover_candidates)
+    }
+    pending_carryover_candidates = tuple(
+        candidate
+        for candidate in carryover_store.list_pending_candidates(book_id)
+        if candidate.candidate_key not in current_carryover_by_key
+    )
+    combined_marketplace_payout_candidates = tuple(
+        [*marketplace_payout_candidates, *(candidate.transaction for candidate in pending_carryover_candidates)]
+    )
 
     if bank_imports:
         parsed_bank_imports: list[tuple[BankImportSpec, tuple[BankStatementData, ...]]] = []
@@ -193,11 +272,18 @@ def build_plan(
             bank_row_count += sum(len(statement.rows) for statement in statements)
             parsed_bank_imports.append((spec, statements))
 
-        bank_txns, bank_warnings, bank_match_results, bank_category_results = build_bank_transactions(
+        (
+            bank_txns,
+            bank_warnings,
+            bank_match_results,
+            bank_transfer_results,
+            bank_category_results,
+        ) = build_bank_transactions(
             tuple(parsed_bank_imports),
             mapping,
             tuple(txn for txn in all_transactions if txn.marketplace in {"etsy", "ebay"}),
-            marketplace_payout_candidates=marketplace_payout_candidates,
+            marketplace_payout_candidates=combined_marketplace_payout_candidates,
+            pending_transfer_anchors=dedupe_store.pending_transfer_anchors(book_id),
         )
         all_transactions.extend(bank_txns)
         all_warnings.extend(bank_warnings)
@@ -214,6 +300,36 @@ def build_plan(
                     f"INFO: Bank/Card parsed {len(statement.rows)} row(s) from {statement.source_path} ({statement.source_format}, {account_label})"
                 )
 
+    carryover_resolution_keys: set[str] = set()
+    matched_marketplace_candidate_ids: set[str] = set()
+    for result in bank_match_results:
+        if result.status != "matched":
+            continue
+        for matched_id in result.matched_transaction_ids:
+            matched_marketplace_candidate_ids.add(matched_id)
+            if _is_carryover_key(matched_id):
+                carryover_resolution_keys.add(matched_id)
+            elif matched_id in current_candidate_resolution_keys:
+                carryover_resolution_keys.add(current_candidate_resolution_keys[matched_id])
+
+    unresolved_current_candidates = [
+        candidate
+        for candidate in current_carryover_candidates
+        if candidate.candidate_key not in carryover_resolution_keys
+        and candidate.transaction.dedupe_key not in matched_marketplace_candidate_ids
+    ]
+    carryover_store.upsert_pending_candidates(book_id, unresolved_current_candidates)
+    matched_carryover_candidate_keys = tuple(sorted(carryover_resolution_keys))
+    pending_carryover_count = carryover_store.pending_count(book_id)
+    if pending_carryover_candidates:
+        all_warnings.append(
+            f"INFO: Loaded {len(pending_carryover_candidates)} pending marketplace carryover candidate(s)"
+        )
+    if unresolved_current_candidates:
+        all_warnings.append(
+            f"INFO: Saved {len(unresolved_current_candidates)} unresolved marketplace carryover candidate(s)"
+        )
+
     dedupe_keys = [txn.dedupe_key for txn in all_transactions]
     existing = dedupe_store.existing_keys(book_id, dedupe_keys)
 
@@ -226,10 +342,65 @@ def build_plan(
         for warning in txn.warnings:
             all_warnings.append(f"{txn.marketplace}:{txn.txn_kind}:{txn.txn_id}: {warning}")
 
+    if bank_txns:
+        category_by_key = {result.bank_dedupe_key: result for result in bank_category_results}
+        transfer_by_key = {result.bank_dedupe_key: result for result in bank_transfer_results}
+        status_by_key = {
+            status_row.transaction.dedupe_key: status_row
+            for status_row in statuses
+            if status_row.transaction.marketplace == "bank"
+        }
+        candidates: list[TransferAnchor] = []
+        resolutions: list[TransferAnchorResolution] = []
+        for dedupe_key, status_row in status_by_key.items():
+            transfer_result = transfer_by_key.get(dedupe_key)
+            if transfer_result and transfer_result.status == "imported_counterpart" and transfer_result.counterpart_dedupe_key:
+                resolutions.append(
+                    TransferAnchorResolution(
+                        anchor_dedupe_key=transfer_result.counterpart_dedupe_key,
+                        counterpart_dedupe_key=dedupe_key,
+                    )
+                )
+            if status_row.status != "ready":
+                continue
+            if transfer_result and transfer_result.status in {"matched", "manual", "counterpart", "imported_counterpart"}:
+                continue
+            category_result = category_by_key.get(dedupe_key)
+            if category_result is None or not category_result.mapped_account_guid:
+                continue
+            source_split = next(
+                (split for split in status_row.transaction.splits if split.mapping_key == "bank:account" and split.account_guid),
+                None,
+            )
+            if source_split is None or source_split.account_guid == category_result.mapped_account_guid:
+                continue
+            candidates.append(
+                TransferAnchor(
+                    anchor_dedupe_key=dedupe_key,
+                    bank_txn_id=status_row.transaction.txn_id,
+                    txn_date=status_row.transaction.date,
+                    amount=status_row.transaction.clearing_amount,
+                    source_account_guid=source_split.account_guid,
+                    source_account_label="",
+                    destination_account_guid=category_result.mapped_account_guid,
+                    destination_account_label="",
+                    description=status_row.transaction.description,
+                    external_ref=status_row.transaction.external_ref,
+                    anchor_source="merchant_default" if category_result.mapping_source == "merchant" else "transaction",
+                )
+            )
+        transfer_anchor_candidates = tuple(candidates)
+        matched_transfer_anchor_resolutions = tuple(resolutions)
+
     return PlanResult(
         transactions=tuple(statuses),
         warnings=tuple(all_warnings),
         marketplace_mapping_keys=marketplace_mapping_keys,
         bank_match_results=bank_match_results,
+        bank_transfer_results=bank_transfer_results,
         bank_category_results=bank_category_results,
+        transfer_anchor_candidates=transfer_anchor_candidates,
+        matched_transfer_anchor_resolutions=matched_transfer_anchor_resolutions,
+        matched_carryover_candidate_keys=matched_carryover_candidate_keys,
+        pending_carryover_count=pending_carryover_count,
     )

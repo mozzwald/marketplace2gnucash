@@ -10,15 +10,19 @@ import unittest
 
 from market2gnucash.core.models import (
     BankImportSpec,
+    EbayInputData,
+    EbayReportRow,
     MappingConfig,
     MarketplaceAccountMapping,
     PlannedSplit,
     PlannedTransaction,
+    TransferAnchor,
 )
 from market2gnucash.core.parsers import parse_bank_statement_file, parse_ebay_report, parse_etsy_inputs
 from market2gnucash.core.rules import (
     bank_merchant_key,
     build_bank_transactions,
+    build_ebay_charge_match_candidates,
     build_ebay_transactions,
     build_ebay_payout_match_candidates,
     build_etsy_deposit_match_candidates,
@@ -29,7 +33,7 @@ from market2gnucash.core.rules import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"
-RS_SAMPLES = SAMPLES / "RS"
+RS_SAMPLES = SAMPLES / "Etsy-RS"
 
 
 class RuleEngineTests(unittest.TestCase):
@@ -106,7 +110,7 @@ class RuleEngineTests(unittest.TestCase):
         self.assertTrue(all("UNBALANCED" not in warning for warning in warnings))
 
     def test_ebay_rules_one_sale_per_order(self) -> None:
-        ebay_data = parse_ebay_report(SAMPLES / "eBay-Transaction_report_20260101_20260131.csv")
+        ebay_data = parse_ebay_report(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260131.csv")
         mapping = self._ebay_mapping(ebay_data.fee_columns)
 
         transactions, _warnings, _columns = build_ebay_transactions(
@@ -132,6 +136,159 @@ class RuleEngineTests(unittest.TestCase):
         for refund in refunds:
             income_memos = [split.memo for split in refund.splits if "sales income" in split.memo.lower()]
             self.assertEqual(income_memos, [])
+
+    def test_ebay_sale_description_falls_back_when_report_description_is_placeholder(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-1",
+                    row_number=1,
+                    date=date(2026, 3, 1),
+                    row_type="Order",
+                    order_number="12-14144-53567",
+                    currency="USD",
+                    net_amount=Decimal("10.00"),
+                    item_subtotal=Decimal("12.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="--",
+                    raw={},
+                ),
+            ),
+            fee_columns=(),
+        )
+
+        transactions, _warnings, _columns = build_ebay_transactions(
+            ebay_data,
+            self._ebay_mapping(()),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0].description, "eBay Sale Order 12-14144-53567")
+
+    def test_ebay_other_fee_rows_post_to_clearing_and_fee_expense(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-fee",
+                    row_number=1,
+                    date=date(2026, 3, 1),
+                    row_type="Other fee",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("-21.95"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="Store (Basic): Subscription Fee Feb 28-Mar 30",
+                    raw={"Reference ID": "fee-1"},
+                ),
+            ),
+            fee_columns=(),
+        )
+
+        transactions, warnings, _columns = build_ebay_transactions(
+            ebay_data,
+            self._ebay_mapping(("Final Value Fee - fixed",)),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(warnings, ())
+        self.assertEqual(len(transactions), 1)
+        txn = transactions[0]
+        self.assertEqual(txn.txn_kind, "other_fee")
+        self.assertEqual(txn.clearing_amount, Decimal("-21.95"))
+        self.assertEqual(sum(split.amount for split in txn.splits), Decimal("0"))
+        self.assertEqual(txn.splits[0].account_guid, "guid-asset-ebay")
+        self.assertEqual(txn.splits[0].amount, Decimal("-21.95"))
+        self.assertEqual(txn.splits[1].account_guid, "guid-exp-ebay-fees")
+        self.assertEqual(txn.splits[1].amount, Decimal("21.95"))
+
+    def test_ebay_charge_rows_generate_negative_bank_match_candidates(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-charge",
+                    row_number=1,
+                    date=date(2026, 2, 1),
+                    row_type="Charge",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("21.95"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="Charge for accrued selling costs from Visa ending in 0101",
+                    raw={},
+                ),
+            ),
+            fee_columns=(),
+        )
+
+        candidates = build_ebay_charge_match_candidates(
+            ebay_data,
+            self._ebay_mapping(()),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.txn_kind, "charge_match")
+        self.assertEqual(candidate.clearing_amount, Decimal("-21.95"))
+        self.assertEqual(candidate.splits[0].account_guid, "guid-asset-ebay")
+        self.assertEqual(candidate.splits[0].amount, Decimal("-21.95"))
+        self.assertEqual(candidate.splits[1].amount, Decimal("21.95"))
+
+    def test_bank_rules_match_sample_ebay_charge_candidate(self) -> None:
+        statement = parse_bank_statement_file(SAMPLES / "Wells-Fargo" / "Wells-Fargo_20260101-20260327.csv")
+        bank_row = next(row for row in statement.rows if row.date == date(2026, 2, 1) and row.amount == Decimal("-21.95"))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "card.csv"
+            path.write_text(
+                "\n".join(
+                    [
+                        "Date,Description,Amount",
+                        f"{bank_row.date.month:02d}/{bank_row.date.day:02d}/{bank_row.date.year},{bank_row.description},{bank_row.amount}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            mini_statement = parse_bank_statement_file(path)
+
+        ebay_data = parse_ebay_report(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260327.csv")
+        charge_candidates = build_ebay_charge_match_candidates(
+            ebay_data,
+            self._ebay_mapping(ebay_data.fee_columns),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        bank_import = BankImportSpec(account_guid="guid-card-account", statement_paths=(str(path),))
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
+            ((bank_import, (mini_statement,)),),
+            self._ebay_mapping(ebay_data.fee_columns),
+            (),
+            marketplace_payout_candidates=charge_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(match_results[0].status, "matched")
+        self.assertEqual(match_results[0].match_source, "charge")
+        self.assertTrue(match_results[0].matched_transaction_ids[0].startswith("ebay:charge:"))
 
     def test_marketplace_dedupe_keys_do_not_collide_across_accounts(self) -> None:
         etsy_data = parse_etsy_inputs(
@@ -178,7 +335,7 @@ class RuleEngineTests(unittest.TestCase):
             statement = parse_bank_statement_file(path)
 
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             self._bank_mapping("unused"),
             (),
@@ -187,6 +344,7 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(len(transactions), 2)
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(match_results), 2)
+        self.assertEqual(len(transfer_results), 2)
         self.assertEqual(len(category_results), 2)
         self.assertTrue(all(result.mapping_source == "unmapped" for result in category_results))
         self.assertEqual({txn.txn_kind for txn in transactions}, {"statement"})
@@ -210,13 +368,14 @@ class RuleEngineTests(unittest.TestCase):
             statement = parse_bank_statement_file(path)
 
         bank_import = BankImportSpec(account_guid=None, statement_paths=(str(path),))
-        transactions, _warnings, match_results, category_results = build_bank_transactions(
+        transactions, _warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             MappingConfig(),
             (),
         )
         self.assertEqual(len(transactions), 1)
         self.assertEqual(len(match_results), 1)
+        self.assertEqual(len(transfer_results), 1)
         self.assertEqual(len(category_results), 1)
         self.assertEqual(category_results[0].mapping_source, "unmapped")
         self.assertTrue(any(w.startswith("MISSING_ACCOUNT") for w in transactions[0].warnings))
@@ -272,7 +431,7 @@ class RuleEngineTests(unittest.TestCase):
             ),
         )
 
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             self._bank_mapping("unused"),
             marketplace_transactions,
@@ -281,6 +440,7 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(transactions), 1)
         self.assertEqual(len(match_results), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(len(category_results), 0)
         self.assertEqual(match_results[0].status, "matched")
         self.assertEqual(
@@ -354,7 +514,7 @@ class RuleEngineTests(unittest.TestCase):
             ),
         )
 
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             self._bank_mapping("unused"),
             marketplace_transactions,
@@ -363,13 +523,14 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(transactions), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(len(category_results), 0)
         self.assertEqual(match_results[0].status, "matched")
         self.assertEqual(match_results[0].match_source, "deposit")
         self.assertEqual(match_results[0].matched_transaction_ids, (target.dedupe_key,))
 
     def test_bank_rules_match_sample_ebay_payout_candidate(self) -> None:
-        statement = parse_bank_statement_file(SAMPLES / "hometown.csv")
+        statement = parse_bank_statement_file(SAMPLES / "Hometown" / "Hometown_20260101-20260327.csv")
         bank_row = next(row for row in statement.rows if row.date == date(2026, 1, 7) and row.amount == Decimal("4.78"))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -385,7 +546,7 @@ class RuleEngineTests(unittest.TestCase):
             )
             mini_statement = parse_bank_statement_file(path)
 
-        ebay_data = parse_ebay_report(SAMPLES / "eBay-Transaction_report_20260101_20260131.csv")
+        ebay_data = parse_ebay_report(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260131.csv")
         payout_candidates = build_ebay_payout_match_candidates(
             ebay_data,
             self._ebay_mapping(ebay_data.fee_columns),
@@ -395,7 +556,7 @@ class RuleEngineTests(unittest.TestCase):
         self.assertTrue(any(candidate.clearing_amount == Decimal("4.78") for candidate in payout_candidates))
 
         bank_import = BankImportSpec(account_guid="guid-bank-account", statement_paths=(str(path),))
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (mini_statement,)),),
             self._ebay_mapping(ebay_data.fee_columns),
             (),
@@ -404,6 +565,7 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(transactions), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(len(category_results), 0)
         self.assertEqual(match_results[0].status, "matched")
         self.assertEqual(match_results[0].match_source, "payout")
@@ -435,7 +597,7 @@ class RuleEngineTests(unittest.TestCase):
             statement = parse_bank_statement_file(path)
 
         bank_import = BankImportSpec(account_guid="guid-card-account", statement_paths=(str(path),))
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             self._etsy_mapping(),
             (),
@@ -444,6 +606,7 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(transactions), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(len(category_results), 0)
         self.assertEqual(match_results[0].status, "matched")
         self.assertEqual(match_results[0].match_source, "payment")
@@ -500,7 +663,7 @@ class RuleEngineTests(unittest.TestCase):
             ),
         )
 
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             MappingConfig(),
             (),
@@ -509,6 +672,7 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertEqual(len(transactions), 1)
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(len(category_results), 0)
         self.assertEqual(match_results[0].status, "ambiguous")
         self.assertEqual(set(match_results[0].marketplace_account_labels), {"Etsy Shop A", "eBay Main"})
@@ -571,7 +735,7 @@ class RuleEngineTests(unittest.TestCase):
                 bank_dedupe_key: ("etsy:sale:etsy:shop-a:10", "etsy:sale:etsy:shop-a:20")
             },
         )
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             mapping,
             marketplace_transactions,
@@ -579,6 +743,7 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertEqual(match_results[0].status, "matched")
+        self.assertEqual(transfer_results[0].status, "unmatched")
         self.assertEqual(match_results[0].match_source, "manual")
         self.assertEqual(len(category_results), 0)
         self.assertTrue(all(split.mapping_key != "bank:suspense" for split in transactions[0].splits))
@@ -604,7 +769,7 @@ class RuleEngineTests(unittest.TestCase):
         mapping = MappingConfig(
             bank_merchant_accounts={merchant_key: "guid-exp-coffee"},
         )
-        transactions, warnings, match_results, category_results = build_bank_transactions(
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             mapping,
             (),
@@ -612,6 +777,7 @@ class RuleEngineTests(unittest.TestCase):
 
         self.assertEqual(len(warnings), 0)
         self.assertTrue(all(result.status == "unmatched" for result in match_results))
+        self.assertTrue(all(result.status == "unmatched" for result in transfer_results))
         self.assertEqual(len(category_results), 2)
         self.assertTrue(all(result.merchant_key == merchant_key for result in category_results))
         self.assertTrue(all(result.mapped_account_guid == "guid-exp-coffee" for result in category_results))
@@ -640,13 +806,14 @@ class RuleEngineTests(unittest.TestCase):
             bank_merchant_accounts={merchant_key: "guid-exp-coffee"},
             bank_txn_account_overrides={"bank:guid-card:A2": "guid-exp-meals"},
         )
-        transactions, warnings, _match_results, category_results = build_bank_transactions(
+        transactions, warnings, _match_results, transfer_results, category_results = build_bank_transactions(
             ((bank_import, (statement,)),),
             mapping,
             (),
         )
 
         self.assertEqual(len(warnings), 0)
+        self.assertTrue(all(result.status == "unmatched" for result in transfer_results))
         self.assertEqual(len(category_results), 2)
         by_dedupe = {result.bank_dedupe_key: result for result in category_results}
         self.assertEqual(by_dedupe["bank:guid-card:A1"].mapping_source, "merchant")
@@ -655,6 +822,287 @@ class RuleEngineTests(unittest.TestCase):
         txn_by_id = {txn.txn_id: txn for txn in transactions}
         self.assertTrue(any(split.account_guid == "guid-exp-coffee" for split in txn_by_id["A1"].splits))
         self.assertTrue(any(split.account_guid == "guid-exp-meals" for split in txn_by_id["A2"].splits))
+
+    def test_bank_rules_match_internal_transfer_between_accounts(self) -> None:
+        checking_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,VISA PAYMENT,-250.00,T1",
+            ]
+        )
+        card_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,PAYMENT FROM CHECKING,250.00,T2",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checking_path = Path(tmp_dir) / "checking.csv"
+            card_path = Path(tmp_dir) / "card.csv"
+            checking_path.write_text(checking_csv, encoding="utf-8")
+            card_path.write_text(card_csv, encoding="utf-8")
+            checking_statement = parse_bank_statement_file(checking_path)
+            card_statement = parse_bank_statement_file(card_path)
+
+        bank_imports = (
+            (BankImportSpec(account_guid="guid-checking", statement_paths=(str(checking_path),)), (checking_statement,)),
+            (BankImportSpec(account_guid="guid-card", statement_paths=(str(card_path),)), (card_statement,)),
+        )
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            MappingConfig(),
+            (),
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(match_results), 2)
+        self.assertEqual(len(transfer_results), 2)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(sorted(result.status for result in transfer_results), ["counterpart", "matched"])
+        txn_status = {txn.txn_id: txn for txn in transactions}
+        ready_txn = next(txn for txn in transactions if not any(w.startswith("TRANSFER_COUNTERPART") for w in txn.warnings))
+        skipped_txn = next(txn for txn in transactions if any(w.startswith("TRANSFER_COUNTERPART") for w in txn.warnings))
+        self.assertTrue(any(split.mapping_key == "bank:matched-transfer" for split in ready_txn.splits))
+        self.assertIn(skipped_txn.txn_id, txn_status)
+
+    def test_bank_rules_ambiguous_transfer_stays_ambiguous(self) -> None:
+        source_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,CARD PAYMENT,-250.00,SRC",
+            ]
+        )
+        card_a_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,PAYMENT,250.00,A1",
+            ]
+        )
+        card_b_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,PAYMENT,250.00,B1",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "source.csv"
+            card_a_path = Path(tmp_dir) / "card_a.csv"
+            card_b_path = Path(tmp_dir) / "card_b.csv"
+            source_path.write_text(source_csv, encoding="utf-8")
+            card_a_path.write_text(card_a_csv, encoding="utf-8")
+            card_b_path.write_text(card_b_csv, encoding="utf-8")
+            source_statement = parse_bank_statement_file(source_path)
+            card_a_statement = parse_bank_statement_file(card_a_path)
+            card_b_statement = parse_bank_statement_file(card_b_path)
+
+        bank_imports = (
+            (BankImportSpec(account_guid="aaa-checking", statement_paths=(str(source_path),)), (source_statement,)),
+            (BankImportSpec(account_guid="guid-card-a", statement_paths=(str(card_a_path),)), (card_a_statement,)),
+            (BankImportSpec(account_guid="guid-card-b", statement_paths=(str(card_b_path),)), (card_b_statement,)),
+        )
+        transactions, warnings, _match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            MappingConfig(),
+            (),
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertTrue(all(result.status in {"ambiguous", "unmatched"} for result in transfer_results))
+        ambiguous_keys = {result.bank_dedupe_key for result in transfer_results if result.status == "ambiguous"}
+        self.assertIn("bank:aaa-checking:SRC", ambiguous_keys)
+        ambiguous_txns = [txn for txn in transactions if any(w.startswith("TRANSFER_AMBIGUOUS") for w in txn.warnings)]
+        self.assertTrue(ambiguous_txns)
+
+    def test_bank_rules_manual_transfer_override_is_used(self) -> None:
+        checking_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/05/2026,ONLINE PAYMENT,-150.00,T3",
+            ]
+        )
+        card_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/08/2026,PAYMENT RECEIVED,150.00,T4",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checking_path = Path(tmp_dir) / "checking.csv"
+            card_path = Path(tmp_dir) / "card.csv"
+            checking_path.write_text(checking_csv, encoding="utf-8")
+            card_path.write_text(card_csv, encoding="utf-8")
+            checking_statement = parse_bank_statement_file(checking_path)
+            card_statement = parse_bank_statement_file(card_path)
+
+        bank_imports = (
+            (BankImportSpec(account_guid="guid-checking", statement_paths=(str(checking_path),)), (checking_statement,)),
+            (BankImportSpec(account_guid="guid-card", statement_paths=(str(card_path),)), (card_statement,)),
+        )
+        mapping = MappingConfig(
+            bank_transfer_overrides={
+                "bank:guid-checking:T3": "bank:guid-card:T4",
+                "bank:guid-card:T4": "bank:guid-checking:T3",
+            }
+        )
+        transactions, warnings, _match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            mapping,
+            (),
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(sorted(result.status for result in transfer_results), ["counterpart", "manual"])
+        ready_txn = next(txn for txn in transactions if not any(w.startswith("TRANSFER_COUNTERPART") for w in txn.warnings))
+        self.assertTrue(any(split.mapping_key == "bank:matched-transfer" for split in ready_txn.splits))
+
+    def test_bank_rules_marketplace_match_wins_over_transfer_match(self) -> None:
+        csv_text = "\n".join(
+            [
+                "Date,Description,Amount,Reference,Currency",
+                "03/20/2026,Etsy Deposit,80.00,B5,USD",
+            ]
+        )
+        transfer_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "03/20/2026,Incoming payment,-80.00,C5",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checking_path = Path(tmp_dir) / "checking.csv"
+            card_path = Path(tmp_dir) / "card.csv"
+            checking_path.write_text(csv_text, encoding="utf-8")
+            card_path.write_text(transfer_csv, encoding="utf-8")
+            checking_statement = parse_bank_statement_file(checking_path)
+            card_statement = parse_bank_statement_file(card_path)
+
+        payout_candidates = (
+            PlannedTransaction(
+                dedupe_key="etsy:deposit:etsy:shop-a:dep-market",
+                marketplace="etsy",
+                marketplace_account_key="etsy:shop-a",
+                marketplace_account_label="Etsy Shop A",
+                txn_kind="deposit_match",
+                txn_id="dep-market",
+                date=date(2026, 3, 20),
+                description="Etsy deposit",
+                external_ref="dep-market",
+                clearing_amount=Decimal("80.00"),
+                splits=(
+                    PlannedSplit(account_guid="guid-asset-etsy", amount=Decimal("80.00"), memo="clearing"),
+                    PlannedSplit(account_guid=None, amount=Decimal("-80.00"), memo="offset"),
+                ),
+                source_row_ids=("dep-market",),
+            ),
+        )
+        bank_imports = (
+            (BankImportSpec(account_guid="guid-checking", statement_paths=(str(checking_path),)), (checking_statement,)),
+            (BankImportSpec(account_guid="guid-card", statement_paths=(str(card_path),)), (card_statement,)),
+        )
+        transactions, warnings, match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            MappingConfig(),
+            (),
+            marketplace_payout_candidates=payout_candidates,
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(category_results), 1)
+        by_match = {result.bank_dedupe_key: result for result in match_results}
+        by_transfer = {result.bank_dedupe_key: result for result in transfer_results}
+        self.assertEqual(by_match["bank:guid-checking:B5"].status, "matched")
+        self.assertEqual(by_transfer["bank:guid-checking:B5"].status, "unmatched")
+        self.assertEqual(by_transfer["bank:guid-card:C5"].status, "unmatched")
+
+    def test_bank_rules_match_imported_transfer_anchor(self) -> None:
+        card_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "04/04/2026,PAYMENT RECEIVED,250.00,T2",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            card_path = Path(tmp_dir) / "card.csv"
+            card_path.write_text(card_csv, encoding="utf-8")
+            card_statement = parse_bank_statement_file(card_path)
+
+        bank_imports = (
+            (BankImportSpec(account_guid="guid-card", statement_paths=(str(card_path),)), (card_statement,)),
+        )
+        pending_anchor = TransferAnchor(
+            anchor_dedupe_key="bank:guid-checking:T1",
+            bank_txn_id="T1",
+            txn_date=date(2026, 3, 30),
+            amount=Decimal("-250.00"),
+            source_account_guid="guid-checking",
+            source_account_label="Assets:Checking",
+            destination_account_guid="guid-card",
+            destination_account_label="Liabilities:Visa",
+            description="ONLINE PAYMENT",
+            external_ref="T1",
+            anchor_source="transaction",
+        )
+
+        transactions, warnings, _match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            MappingConfig(),
+            (),
+            pending_transfer_anchors=(pending_anchor,),
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(len(category_results), 0)
+        self.assertEqual(transfer_results[0].status, "imported_counterpart")
+        self.assertEqual(transfer_results[0].counterpart_dedupe_key, "bank:guid-checking:T1")
+        self.assertTrue(any(w.startswith("IMPORTED_TRANSFER_COUNTERPART") for w in transactions[0].warnings))
+
+    def test_bank_rules_ignore_imported_transfer_anchor_outside_ten_days(self) -> None:
+        card_csv = "\n".join(
+            [
+                "Date,Description,Amount,Reference",
+                "04/15/2026,PAYMENT RECEIVED,250.00,T2",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            card_path = Path(tmp_dir) / "card.csv"
+            card_path.write_text(card_csv, encoding="utf-8")
+            card_statement = parse_bank_statement_file(card_path)
+
+        bank_imports = (
+            (BankImportSpec(account_guid="guid-card", statement_paths=(str(card_path),)), (card_statement,)),
+        )
+        pending_anchor = TransferAnchor(
+            anchor_dedupe_key="bank:guid-checking:T1",
+            bank_txn_id="T1",
+            txn_date=date(2026, 3, 30),
+            amount=Decimal("-250.00"),
+            source_account_guid="guid-checking",
+            source_account_label="Assets:Checking",
+            destination_account_guid="guid-card",
+            destination_account_label="Liabilities:Visa",
+            description="ONLINE PAYMENT",
+            external_ref="T1",
+            anchor_source="merchant_default",
+        )
+
+        transactions, warnings, _match_results, transfer_results, category_results = build_bank_transactions(
+            bank_imports,
+            MappingConfig(),
+            (),
+            pending_transfer_anchors=(pending_anchor,),
+        )
+
+        self.assertEqual(len(warnings), 0)
+        self.assertEqual(transfer_results[0].status, "unmatched")
+        self.assertEqual(category_results[0].mapping_source, "unmapped")
+        self.assertTrue(any(w.startswith("UNMAPPED") for w in transactions[0].warnings))
 
 
 if __name__ == "__main__":

@@ -29,11 +29,16 @@ fi
 
 if [[ ! -d "${VENV_DIR}" ]]; then
   echo "Creating virtual environment at ${VENV_DIR}"
-  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv --system-site-packages "${VENV_DIR}"
 fi
 
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
+
+if [[ -f "${VENV_DIR}/pyvenv.cfg" ]] && ! grep -qi '^include-system-site-packages = true$' "${VENV_DIR}/pyvenv.cfg"; then
+  echo "Warning: existing ${VENV_DIR} may not include system site packages." >&2
+  echo "If 'import gnucash' fails below, delete ${VENV_DIR} and rerun ./build.sh." >&2
+fi
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -e ".[build]"

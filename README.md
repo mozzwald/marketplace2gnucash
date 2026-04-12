@@ -125,16 +125,25 @@ The project is set up for a PyInstaller `onedir` build.
 Prerequisites:
 
 1. Build with a Python interpreter that can already import `gnucash`.
-2. Install build dependencies:
+2. Run the bootstrap build script from the repo root:
 
 ```bash
-pip install -e ".[build]"
+./build.sh
 ```
 
-Build command:
+What `build.sh` does:
+
+- Selects `PYTHON` if provided, otherwise tries `python3.12`, `python3.11`, then `python3`
+- Creates `.venv/` if needed
+- Upgrades `pip`, `setuptools`, and `wheel`
+- Installs the project with build extras
+- Fails fast if the chosen interpreter cannot import `gnucash`
+- Runs the standalone PyInstaller build
+
+If the machine has multiple Python installs and only one can import the GnuCash bindings, point the script at it:
 
 ```bash
-python tools/build_standalone.py --clean
+PYTHON=/path/to/python ./build.sh
 ```
 
 Output:

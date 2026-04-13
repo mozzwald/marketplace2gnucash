@@ -28,6 +28,7 @@ from market2gnucash.core.rules import (
     build_etsy_deposit_match_candidates,
     build_etsy_payment_match_candidates,
     build_etsy_transactions,
+    ebay_standalone_fee_mapping_key,
 )
 
 
@@ -211,6 +212,56 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(txn.splits[1].account_guid, "guid-exp-ebay-fees")
         self.assertEqual(txn.splits[1].amount, Decimal("21.95"))
 
+    def test_ebay_other_fee_rows_can_use_explicit_standalone_mapping_key(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-fee",
+                    row_number=1,
+                    date=date(2026, 1, 1),
+                    row_type="Other fee",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("-21.95"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="Store (Basic): Subscription Fee Dec 2025 - Jan 2026",
+                    raw={"Reference ID": "fee-jan"},
+                ),
+            ),
+            fee_columns=(),
+        )
+        mapping = MappingConfig(
+            marketplace_accounts={
+                "ebay:main": MarketplaceAccountMapping(
+                    marketplace="ebay",
+                    account_label="eBay Main",
+                    clearing_guid="guid-asset-ebay",
+                    income_guid="guid-income-ebay",
+                    refunds_guid="guid-exp-refunds-ebay",
+                    fee_accounts={ebay_standalone_fee_mapping_key(): "guid-exp-subscription"},
+                )
+            }
+        )
+
+        transactions, warnings, mapping_keys = build_ebay_transactions(
+            ebay_data,
+            mapping,
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(warnings, ())
+        self.assertEqual(mapping_keys, (ebay_standalone_fee_mapping_key(),))
+        self.assertEqual(len(transactions), 1)
+        txn = transactions[0]
+        self.assertEqual(txn.txn_kind, "other_fee")
+        self.assertEqual(txn.splits[1].account_guid, "guid-exp-subscription")
+        self.assertEqual(txn.splits[1].mapping_key, ebay_standalone_fee_mapping_key())
+
     def test_ebay_charge_rows_generate_negative_bank_match_candidates(self) -> None:
         ebay_data = EbayInputData(
             report_rows=(
@@ -248,6 +299,54 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(candidate.splits[0].account_guid, "guid-asset-ebay")
         self.assertEqual(candidate.splits[0].amount, Decimal("-21.95"))
         self.assertEqual(candidate.splits[1].amount, Decimal("21.95"))
+
+    def test_ebay_charge_candidates_are_skipped_when_paired_other_fee_is_unmapped(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-charge",
+                    row_number=1,
+                    date=date(2026, 2, 1),
+                    row_type="Charge",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("21.95"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="Charge for accrued selling costs from Visa ending in 0101",
+                    raw={"Payout ID": "7316806390"},
+                ),
+                EbayReportRow(
+                    row_id="row-fee",
+                    row_number=2,
+                    date=date(2026, 2, 1),
+                    row_type="Other fee",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("-21.95"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="Store (Basic): Subscription Fee Jan 31-Feb 27",
+                    raw={"Payout ID": "7316806390", "Reference ID": "fee-1"},
+                ),
+            ),
+            fee_columns=(),
+        )
+
+        candidates = build_ebay_charge_match_candidates(
+            ebay_data,
+            self._ebay_mapping(()),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(candidates, ())
 
     def test_bank_rules_match_sample_ebay_charge_candidate(self) -> None:
         statement = parse_bank_statement_file(SAMPLES / "Wells-Fargo" / "Wells-Fargo_20260101-20260327.csv")

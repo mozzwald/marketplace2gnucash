@@ -32,7 +32,6 @@ from market2gnucash.core.rules import (
     build_etsy_deposit_match_candidates,
     build_etsy_payment_match_candidates,
     build_etsy_transactions,
-    ebay_mapping_key,
 )
 
 
@@ -187,15 +186,13 @@ def build_plan(
                 start_date=start_date,
                 end_date=end_date,
             )
-            ebay_txns, ebay_warnings, ebay_fee_columns = build_ebay_transactions(
+            ebay_txns, ebay_warnings, ebay_mapping_keys = build_ebay_transactions(
                 ebay_data,
                 mapping,
                 account_key=marketplace_import.account_key,
                 account_label=marketplace_import.account_label,
             )
-            marketplace_mapping_keys[marketplace_import.account_key] = tuple(
-                sorted({ebay_mapping_key(column) for column in ebay_fee_columns})
-            )
+            marketplace_mapping_keys[marketplace_import.account_key] = tuple(sorted(set(ebay_mapping_keys)))
             marketplace_payout_candidates = tuple(
                 [
                     *marketplace_payout_candidates,

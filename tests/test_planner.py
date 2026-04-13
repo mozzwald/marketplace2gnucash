@@ -10,7 +10,7 @@ from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping, TransferAnchor
 from market2gnucash.core.planner import build_plan
-from market2gnucash.core.rules import bank_merchant_key
+from market2gnucash.core.rules import bank_merchant_key, ebay_standalone_fee_mapping_key
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -355,6 +355,113 @@ class PlannerTests(unittest.TestCase):
             plan.matched_transfer_anchor_resolutions[0].anchor_dedupe_key,
             "bank:guid-checking:T1",
         )
+
+    def test_build_plan_leaves_ebay_charge_unmatched_when_paired_other_fee_mapping_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "ebay:main": MarketplaceAccountMapping(
+                        marketplace="ebay",
+                        account_label="eBay Main",
+                        clearing_guid="guid-asset-ebay",
+                        income_guid="guid-income-ebay",
+                        refunds_guid="guid-refunds-ebay",
+                        fee_accounts={},
+                    )
+                }
+            )
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "ebay-import",
+                        "marketplace": "ebay",
+                        "account_key": "ebay:main",
+                        "account_label": "eBay Main",
+                        "ebay_report_path": str(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260327.csv"),
+                    }
+                ],
+                bank_imports=[
+                    {
+                        "account_guid": "guid-card-account",
+                        "statement_paths": [str(SAMPLES / "Wells-Fargo" / "Wells-Fargo_20260101-20260327.csv")],
+                        "csv_profiles": {},
+                    }
+                ],
+                start_date=date(2026, 2, 1),
+                end_date=date(2026, 2, 28),
+            )
+
+        blocked_marketplace = [
+            row
+            for row in plan.transactions
+            if row.transaction.marketplace == "ebay" and row.transaction.txn_kind == "other_fee"
+        ]
+        self.assertTrue(blocked_marketplace)
+        self.assertTrue(any(row.status == "blocked" for row in blocked_marketplace))
+
+        matching_bank_rows = [
+            result
+            for result in plan.bank_match_results
+            if result.bank_date == date(2026, 2, 1) and result.bank_amount == Decimal("-21.95")
+        ]
+        self.assertEqual(len(matching_bank_rows), 1)
+        self.assertEqual(matching_bank_rows[0].status, "unmatched")
+
+        bank_categories = [
+            result
+            for result in plan.bank_category_results
+            if result.txn_date == date(2026, 2, 1) and result.amount == Decimal("-21.95")
+        ]
+        self.assertEqual(len(bank_categories), 1)
+        self.assertEqual(bank_categories[0].mapping_source, "unmapped")
+
+    def test_build_plan_exposes_ebay_standalone_fee_mapping_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "ebay:main": MarketplaceAccountMapping(
+                        marketplace="ebay",
+                        account_label="eBay Main",
+                        clearing_guid="guid-asset-ebay",
+                        income_guid="guid-income-ebay",
+                        refunds_guid="guid-refunds-ebay",
+                        fee_accounts={},
+                    )
+                }
+            )
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "ebay-import",
+                        "marketplace": "ebay",
+                        "account_key": "ebay:main",
+                        "account_label": "eBay Main",
+                        "ebay_report_path": str(SAMPLES / "eBay-RS" / "eBay-Transaction_report_20260101_20260131.csv"),
+                    }
+                ],
+                bank_imports=[],
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 1, 31),
+            )
+
+        self.assertIn("ebay:main", plan.marketplace_mapping_keys)
+        self.assertIn(ebay_standalone_fee_mapping_key(), plan.marketplace_mapping_keys["ebay:main"])
 
 
 if __name__ == "__main__":

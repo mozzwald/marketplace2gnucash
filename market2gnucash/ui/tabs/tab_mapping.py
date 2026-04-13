@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from market2gnucash.core.models import AccountRecord, MappingConfig, MarketplaceAccountMapping
 from market2gnucash.core.parsers import parse_ebay_report, parse_etsy_statement
-from market2gnucash.core.rules import ebay_mapping_key, etsy_mapping_key
+from market2gnucash.core.rules import ebay_mapping_key, ebay_standalone_fee_mapping_key, etsy_mapping_key
 from market2gnucash.ui.account_picker import AccountPickerDialog
 
 
@@ -216,6 +216,8 @@ class MappingTab(QWidget):
                         end_date,
                     )
                     found_keys.update(ebay_mapping_key(column) for column in ebay_data.fee_columns)
+                    if any(row.row_type == "Other fee" for row in ebay_data.report_rows):
+                        found_keys.add(ebay_standalone_fee_mapping_key())
                 mapping_keys[marketplace_import["account_key"]] = tuple(sorted(found_keys))
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))
@@ -259,7 +261,12 @@ class MappingTab(QWidget):
         accounts_by_guid = self.app_state.get("accounts_by_guid", {})
 
         for row_index, key in enumerate(keys):
-            display_key = key.removeprefix("ebay:fee_col:")
+            if key.startswith("ebay:fee_col:"):
+                display_key = key.removeprefix("ebay:fee_col:")
+            elif key.startswith("ebay:standalone_fee:"):
+                display_key = f"Standalone {key.removeprefix('ebay:standalone_fee:')}"
+            else:
+                display_key = key
             self.fee_table.setItem(row_index, 0, QTableWidgetItem(display_key))
 
             guid = account_mapping.fee_accounts.get(key)
@@ -290,7 +297,7 @@ class MappingTab(QWidget):
         dialog = AccountPickerDialog(
             accounts,
             selected_guid=current_guid,
-            allowed_types={"EXPENSE", "INCOME", "ASSET", "BANK", "CASH"},
+            allowed_types={"EXPENSE", "INCOME", "ASSET", "BANK", "CASH", "EQUITY"},
             parent=self,
         )
         if dialog.exec() != QDialog.Accepted:

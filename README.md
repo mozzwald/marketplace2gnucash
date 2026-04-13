@@ -134,7 +134,7 @@ Prerequisites:
 What `build.sh` does:
 
 - Selects `PYTHON` if provided, otherwise tries `python3.12`, `python3.11`, then `python3`
-- Creates `.venv/` if needed
+- Creates `.venv/` with `--system-site-packages` if needed so OS-installed `gnucash` bindings stay visible
 - Upgrades `pip`, `setuptools`, and `wheel`
 - Installs the project with build extras
 - Fails fast if the chosen interpreter cannot import `gnucash`
@@ -145,6 +145,8 @@ If the machine has multiple Python installs and only one can import the GnuCash 
 ```bash
 PYTHON=/path/to/python ./build.sh
 ```
+
+If you already created `.venv/` without system site packages, remove it and rerun `./build.sh`.
 
 Output:
 

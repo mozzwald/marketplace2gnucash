@@ -69,6 +69,10 @@ def ebay_mapping_key(column_name: str) -> str:
     return f"ebay:fee_col:{column_name}"
 
 
+def ebay_standalone_fee_mapping_key(row_type: str = "Other fee") -> str:
+    return f"ebay:standalone_fee:{row_type}"
+
+
 def bank_merchant_key(description: str) -> str:
     tokens = re.findall(r"[a-z0-9]+", description.lower())
     filtered: list[str] = []
@@ -660,10 +664,13 @@ def build_ebay_transactions(
 
     rows = data.report_rows
     by_order: dict[str, list[EbayReportRow]] = defaultdict(list)
+    mapping_keys: set[str] = {ebay_mapping_key(column) for column in data.fee_columns}
 
     for row in rows:
         if row.row_type == "Order" and row.order_number:
             by_order[row.order_number].append(row)
+        elif row.row_type == "Other fee":
+            mapping_keys.add(ebay_standalone_fee_mapping_key(row.row_type))
 
     consumed_rows: set[str] = set()
 
@@ -858,7 +865,9 @@ def build_ebay_transactions(
             continue
 
         fee_warnings: list[str] = []
-        if default_fee_account_guid is None:
+        mapping_key = ebay_standalone_fee_mapping_key(row.row_type)
+        fee_account_guid = account_mapping.fee_accounts.get(mapping_key) or default_fee_account_guid
+        if fee_account_guid is None:
             fee_warnings.append(
                 "UNMAPPED: No default eBay fee account available for standalone Other fee rows"
             )
@@ -884,10 +893,10 @@ def build_ebay_transactions(
 
         splits.append(
             PlannedSplit(
-                account_guid=default_fee_account_guid,
+                account_guid=fee_account_guid,
                 amount=-row.net_amount,
                 memo=row.description or "eBay Other fee",
-                mapping_key="ebay:standalone_fee:Other fee",
+                mapping_key=mapping_key,
             )
         )
 
@@ -922,8 +931,7 @@ def build_ebay_transactions(
         )
 
     transactions.sort(key=lambda txn: (txn.date, txn.marketplace, txn.txn_kind, txn.txn_id))
-    fee_columns = tuple(sorted(data.fee_columns))
-    return tuple(transactions), tuple(warnings), fee_columns
+    return tuple(transactions), tuple(warnings), tuple(sorted(mapping_keys))
 
 
 def build_ebay_payout_match_candidates(
@@ -1002,12 +1010,23 @@ def build_ebay_charge_match_candidates(
     if not account_mapping.clearing_guid:
         return ()
 
+    default_fee_account_guid = _unique_fee_account_guid(account_mapping)
+    paired_other_fees: set[tuple[date, str, Decimal]] = set()
+    for row in data.report_rows:
+        if row.row_type != "Other fee":
+            continue
+        payout_id = row.raw.get("Payout ID") or ""
+        paired_other_fees.add((row.date, payout_id, abs(row.net_amount)))
+
     candidates: list[PlannedTransaction] = []
     for row in data.report_rows:
         if row.row_type != "Charge":
             continue
         amount = -abs(row.net_amount)
         if amount == ZERO:
+            continue
+        payout_id = row.raw.get("Payout ID") or ""
+        if default_fee_account_guid is None and (row.date, payout_id, abs(row.net_amount)) in paired_other_fees:
             continue
         external_ref = row.raw.get("Reference ID") or row.raw.get("Payout ID") or row.row_id
         description = _first_nonempty(row.description, f"eBay Charge {external_ref}") or f"eBay Charge {external_ref}"

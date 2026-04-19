@@ -1,10 +1,17 @@
 # market2gnucash
 
-Cross-platform Python 3.11+ desktop GUI (PySide6) to import Etsy/eBay CSV exports into an existing GnuCash XML book using GnuCash Python bindings.
+Cross-platform Python 3.11+ desktop GUI (PySide6) to import Etsy/eBay marketplace exports plus bank/card statements into an existing GnuCash XML book using the GnuCash Python bindings.
 
 ## Features
 
-- Single-window tabbed workflow: `Book` / `Inputs` / `Mapping` / `Preview` / `Import`
+- Single-window tabbed workflow:
+  - `Book`
+  - `Inputs`
+  - `Marketplace Mapping`
+  - `Bank/Card Mapping`
+  - `Preview`
+  - `Import`
+  - `Settings`
 - Book safety checks:
   - Reads book metadata and root GUID (`book_id`)
   - Detects lock sidecar files (`.LCK`, `.LNK`, `.lock`) and blocks writes
@@ -12,8 +19,13 @@ Cross-platform Python 3.11+ desktop GUI (PySide6) to import Etsy/eBay CSV export
 - Idempotent imports:
   - Per-book dedupe keys stored in SQLite
   - Duplicate planned transactions are marked and skipped
+  - Stable row fingerprints plus occurrence numbering prevent duplicate imports when refreshed monthly exports are overwritten with newer copies
 - Multi-book support:
   - Inputs + mapping configuration persisted per `book_id`
+- Bank/card import support:
+  - CSV and OFX/QFX statements
+  - Multiple statement files per account import bundle
+  - CSV profile/mapping support for headerless or nonstandard CSV layouts
 - Decimal-only monetary handling (no float arithmetic)
 
 ## Required Inputs
@@ -28,6 +40,15 @@ Both files are required:
 ### eBay
 
 - `eBay Transaction report CSV`
+
+### Bank / Card
+
+- One import bundle per bank or card account
+- Attach one or more statement files per bundle
+- Supported formats:
+  - CSV
+  - OFX / QFX
+- Nonstandard or headerless CSV layouts can be configured through the app's CSV mapping dialog
 
 ## Accounting Rules Implemented
 
@@ -85,6 +106,13 @@ User selects one clearing account per marketplace (asset/current asset style):
 - `Seller collected tax` is considered informationally in planning
 - `eBay collected tax` is ignored for posting logic
 
+### Bank / card planning
+
+- Bank/card transactions are imported against the selected GnuCash asset or liability account for each statement bundle
+- Marketplace payout/charge candidates can be matched against bank/card rows in preview
+- Internal transfers between bank/card accounts can be matched or manually overridden in `Bank/Card Mapping`
+- Merchant defaults and per-transaction account overrides are supported for unmatched bank/card activity
+
 ## Installation
 
 ```bash
@@ -104,7 +132,7 @@ pip install -e ".[dev]"
 
 GnuCash bindings are generally installed from OS/GnuCash packages, not PyPI.
 
-If bindings are unavailable, preview can still be generated, but import/write will fail and be blocked.
+If bindings are unavailable, preview and mapping can still be generated, but import/write will fail and be blocked.
 
 ## Run
 
@@ -166,18 +194,20 @@ Notes:
 1. Close GnuCash before importing.
 2. Open the correct `.gnucash` file in the `Book` tab.
 3. Confirm lock status shows not locked.
-4. Select CSV files in `Inputs`.
-5. Configure required accounts and fee mappings in `Mapping`.
-6. Run dry-run in `Preview` and resolve warnings.
-7. Import in `Import` (backup is created automatically first).
+4. In `Inputs`, add marketplace account bundles and any bank/card statement bundles.
+5. Configure marketplace clearing, income, refund, and fee mappings in `Marketplace Mapping`.
+6. Review bank/card matches, transfer matches, and category overrides in `Bank/Card Mapping`.
+7. Run dry-run in `Preview` and resolve warnings, duplicates, or deferred items.
+8. Import in `Import` after confirming the planned transactions (backup is created automatically first).
 
 ## Project Structure
 
-- `market2gnucash/core/parsers.py`: CSV parsing (Etsy/eBay)
+- `market2gnucash/core/parsers.py`: Etsy/eBay parsers plus bank/card CSV and OFX/QFX parsing
 - `market2gnucash/core/rules.py`: planning rules -> planned transactions/splits
 - `market2gnucash/core/planner.py`: dedupe-aware dry-run planning
 - `market2gnucash/core/config_store.py`: per-book JSON config
 - `market2gnucash/core/dedupe_store.py`: per-book SQLite dedupe
+- `market2gnucash/core/carryover_store.py`: pending marketplace payout/charge carryover state
 - `market2gnucash/core/book_io.py`: book metadata, lock detection, backup
 - `market2gnucash/core/gnucash_writer.py`: bindings write implementation
 - `market2gnucash/ui/`: PySide6 tabs and window

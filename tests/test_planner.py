@@ -232,6 +232,149 @@ class PlannerTests(unittest.TestCase):
             carryover_store.resolve_candidates("book-1", list(february_plan.matched_carryover_candidate_keys))
             self.assertEqual(carryover_store.pending_count("book-1"), 0)
 
+    def test_build_plan_only_imports_new_identical_etsy_listing_fees_after_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            statement_path = Path(tmp_dir) / "etsy_statement_2026_4.csv"
+            sold_orders_path = Path(tmp_dir) / "EtsySoldOrders2026-4.csv"
+
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "etsy:shop-a": MarketplaceAccountMapping(
+                        marketplace="etsy",
+                        account_label="Shop A",
+                        clearing_guid="guid-asset-etsy",
+                        income_guid="guid-income-etsy",
+                        refunds_guid="guid-refunds-etsy",
+                        fee_accounts={"etsy:Fee:Listing fee": "guid-exp-listing"},
+                    )
+                }
+            )
+            sold_orders_path.write_text(
+                "Sale Date,Order ID,Currency,Order Value,Shipping,Sales Tax,Order Total\n",
+                encoding="utf-8",
+            )
+
+            def write_listing_fee_rows(count: int) -> None:
+                rows = [
+                    "Date,Type,Title,Info,Currency,Amount,Fees & Taxes,Net,Tax Details",
+                    *[
+                        '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,'
+                        for _ in range(count)
+                    ],
+                ]
+                statement_path.write_text("\n".join(rows), encoding="utf-8")
+
+            write_listing_fee_rows(5)
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "import-a",
+                        "marketplace": "etsy",
+                        "account_key": "etsy:shop-a",
+                        "account_label": "Shop A",
+                        "etsy_statement_path": str(statement_path),
+                        "etsy_sold_orders_path": str(sold_orders_path),
+                    }
+                ],
+                bank_imports=[],
+                start_date=date(2026, 4, 13),
+                end_date=date(2026, 4, 13),
+            )
+
+            first_listing_rows = [row for row in first_plan.transactions if row.transaction.txn_kind == "listing_fee"]
+            self.assertEqual(len(first_listing_rows), 5)
+            self.assertTrue(all(row.status == "ready" for row in first_listing_rows))
+            dedupe_store.mark_imported("book-1", [row.transaction.dedupe_key for row in first_listing_rows])
+
+            write_listing_fee_rows(7)
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "import-a",
+                        "marketplace": "etsy",
+                        "account_key": "etsy:shop-a",
+                        "account_label": "Shop A",
+                        "etsy_statement_path": str(statement_path),
+                        "etsy_sold_orders_path": str(sold_orders_path),
+                    }
+                ],
+                bank_imports=[],
+                start_date=date(2026, 4, 13),
+                end_date=date(2026, 4, 13),
+            )
+
+            second_listing_rows = [row for row in second_plan.transactions if row.transaction.txn_kind == "listing_fee"]
+            self.assertEqual(len(second_listing_rows), 7)
+            self.assertEqual(sum(1 for row in second_listing_rows if row.status == "duplicate"), 5)
+            self.assertEqual(sum(1 for row in second_listing_rows if row.status == "ready"), 2)
+
+    def test_build_plan_only_imports_new_identical_bank_rows_after_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            card_path = Path(tmp_dir) / "card.csv"
+
+            def write_card_rows(count: int) -> None:
+                rows = [
+                    "Date,Description,Amount",
+                    *["04/13/2026,VISA PURCHASE,-1.00" for _ in range(count)],
+                ]
+                card_path.write_text("\n".join(rows), encoding="utf-8")
+
+            write_card_rows(3)
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VISA PURCHASE"): "guid-exp-card"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_paths": [str(card_path)], "csv_profiles": {}}
+                ],
+                start_date=date(2026, 4, 13),
+                end_date=date(2026, 4, 13),
+            )
+
+            first_bank_rows = [row for row in first_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(first_bank_rows), 3)
+            self.assertTrue(all(row.status == "ready" for row in first_bank_rows))
+            dedupe_store.mark_imported("book-1", [row.transaction.dedupe_key for row in first_bank_rows])
+
+            write_card_rows(5)
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VISA PURCHASE"): "guid-exp-card"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_paths": [str(card_path)], "csv_profiles": {}}
+                ],
+                start_date=date(2026, 4, 13),
+                end_date=date(2026, 4, 13),
+            )
+
+            second_bank_rows = [row for row in second_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(second_bank_rows), 5)
+            self.assertEqual(sum(1 for row in second_bank_rows if row.status == "duplicate"), 3)
+            self.assertEqual(sum(1 for row in second_bank_rows if row.status == "ready"), 2)
+
     def test_build_plan_exposes_balance_sheet_transfer_anchor_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "dedupe.sqlite3"

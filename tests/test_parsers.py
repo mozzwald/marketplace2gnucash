@@ -54,6 +54,41 @@ class ParserTests(unittest.TestCase):
         self.assertGreater(len(listing_rows), 0)
         self.assertTrue(all(row.listing_id for row in listing_rows))
 
+    def test_parse_etsy_statement_row_ids_remain_stable_when_file_grows(self) -> None:
+        initial_csv = "\n".join(
+            [
+                "Date,Type,Title,Info,Currency,Amount,Fees & Taxes,Net,Tax Details",
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+            ]
+        )
+        grown_csv = "\n".join(
+            [
+                "Date,Type,Title,Info,Currency,Amount,Fees & Taxes,Net,Tax Details",
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+                '04/13/2026,Fee,"Listing fee","Listing #123","USD",-0.20,,-0.20,',
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "etsy_statement_2026_4.csv"
+            path.write_text(initial_csv, encoding="utf-8")
+            initial_rows = parse_etsy_statement(path)
+
+            path.write_text(grown_csv, encoding="utf-8")
+            grown_rows = parse_etsy_statement(path)
+
+        self.assertEqual([row.row_id for row in initial_rows], [row.row_id for row in grown_rows[:5]])
+        self.assertEqual(len({row.row_id for row in grown_rows}), 7)
+
     def test_parse_bank_csv_with_debit_credit_columns(self) -> None:
         csv_text = "\n".join(
             [
@@ -161,6 +196,40 @@ class ParserTests(unittest.TestCase):
         self.assertGreater(len(statement.rows), 10)
         self.assertEqual(statement.rows[6].amount, Decimal("-20.00"))
         self.assertIn("OPENAI", statement.rows[6].description)
+
+    def test_parse_bank_csv_row_ids_remain_stable_when_file_grows_without_reference_ids(self) -> None:
+        initial_csv = "\n".join(
+            [
+                "Date,Description,Amount",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+            ]
+        )
+        grown_csv = "\n".join(
+            [
+                "Date,Description,Amount",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+                "04/13/2026,VISA PURCHASE,-1.00",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "card.csv"
+            path.write_text(initial_csv, encoding="utf-8")
+            initial_statement = parse_bank_statement_file(path)
+
+            path.write_text(grown_csv, encoding="utf-8")
+            grown_statement = parse_bank_statement_file(path)
+
+        self.assertEqual(
+            [row.row_id for row in initial_statement.rows],
+            [row.row_id for row in grown_statement.rows[:3]],
+        )
+        self.assertEqual(len({row.row_id for row in grown_statement.rows}), 5)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import re
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -106,6 +107,102 @@ _KNOWN_CSV_COLUMNS = (
 def _hash_row(parts: list[str]) -> str:
     payload = "\x1f".join(parts).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()
+
+
+def _decimal_text(value: Decimal | None) -> str:
+    if value is None:
+        return ""
+    return format(value, "f")
+
+
+def _stable_row_id(prefix: str, signature_parts: list[str], occurrence: int) -> str:
+    return _hash_row([prefix, *signature_parts, str(occurrence)])
+
+
+def _assign_occurrence_row_ids(
+    rows: list,
+    *,
+    prefix: str,
+    signature_parts,
+) -> tuple:
+    occurrence_by_signature: dict[tuple[str, ...], int] = {}
+    updated_rows = []
+    for row in rows:
+        signature = tuple(signature_parts(row))
+        occurrence = occurrence_by_signature.get(signature, 0) + 1
+        occurrence_by_signature[signature] = occurrence
+        updated_rows.append(replace(row, row_id=_stable_row_id(prefix, list(signature), occurrence)))
+    return tuple(updated_rows)
+
+
+def _etsy_statement_signature(row: EtsyStatementRow) -> list[str]:
+    return [
+        row.date.isoformat(),
+        row.row_type,
+        row.title,
+        row.info,
+        row.currency,
+        _decimal_text(row.amount),
+        _decimal_text(row.fees_taxes),
+        _decimal_text(row.net),
+        row.tax_details,
+        row.order_id or "",
+        row.listing_id or "",
+    ]
+
+
+def _etsy_sold_order_signature(row: EtsySoldOrderRow) -> list[str]:
+    return [
+        row.sale_date.isoformat(),
+        row.order_id,
+        row.currency,
+        _decimal_text(row.order_value),
+        _decimal_text(row.shipping),
+        _decimal_text(row.sales_tax),
+        _decimal_text(row.order_total),
+    ]
+
+
+def _ebay_fee_columns_signature(row: EbayReportRow) -> list[str]:
+    parts: list[str] = []
+    for key, value in sorted(row.fee_columns.items()):
+        parts.extend([key, _decimal_text(value)])
+    return parts
+
+
+def _ebay_report_signature(row: EbayReportRow) -> list[str]:
+    return [
+        row.date.isoformat(),
+        row.row_type,
+        row.order_number or "",
+        row.currency,
+        _decimal_text(row.net_amount),
+        _decimal_text(row.item_subtotal),
+        _decimal_text(row.shipping_and_handling),
+        _decimal_text(row.seller_collected_tax),
+        _decimal_text(row.ebay_collected_tax),
+        row.description,
+        row.raw.get("Reference ID", ""),
+        row.raw.get("Payout ID", ""),
+        row.raw.get("Transaction ID", ""),
+        row.raw.get("Legacy order ID", ""),
+        *_ebay_fee_columns_signature(row),
+    ]
+
+
+def _bank_statement_signature(row: BankStatementRow) -> list[str]:
+    return [
+        row.date.isoformat(),
+        _decimal_text(row.amount),
+        row.currency or "",
+        row.description,
+        row.memo,
+        row.fitid or "",
+        row.check_number or "",
+        row.transaction_type or "",
+        row.account_id or "",
+        row.account_name or "",
+    ]
 
 
 def _within_date_range(row_date: date, start_date: date | None, end_date: date | None) -> bool:
@@ -378,20 +475,9 @@ def _parse_profiled_bank_csv(
         fitid = _value_from_profile(raw, profile.id_column)
         check_number = _value_from_profile(raw, profile.check_number_column)
 
-        row_id = _hash_row(
-            [
-                "bank_csv_profile",
-                str(path),
-                str(index),
-                date_text,
-                str(amount),
-                fitid or "",
-                description,
-            ]
-        )
         rows.append(
             BankStatementRow(
-                row_id=row_id,
+                row_id="",
                 row_number=index,
                 date=row_date,
                 amount=amount,
@@ -415,7 +501,11 @@ def _parse_profiled_bank_csv(
         account_id=account_id,
         account_name=account_name or path.stem,
         currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
-        rows=tuple(rows),
+        rows=_assign_occurrence_row_ids(
+            rows,
+            prefix="bank_csv_profile",
+            signature_parts=_bank_statement_signature,
+        ),
     )
 
 
@@ -494,20 +584,9 @@ def _parse_bank_csv(
         fitid = _find_first_present(raw, _CSV_ID_COLUMNS)
         check_number = _find_first_present(raw, _CSV_CHECK_NUMBER_COLUMNS)
 
-        row_id = _hash_row(
-            [
-                "bank_csv",
-                str(path),
-                str(index),
-                date_text,
-                str(amount),
-                fitid or "",
-                description,
-            ]
-        )
         rows.append(
             BankStatementRow(
-                row_id=row_id,
+                row_id="",
                 row_number=index,
                 date=row_date,
                 amount=amount,
@@ -531,7 +610,11 @@ def _parse_bank_csv(
         account_id=account_id,
         account_name=account_name or path.stem,
         currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
-        rows=tuple(rows),
+        rows=_assign_occurrence_row_ids(
+            rows,
+            prefix="bank_csv",
+            signature_parts=_bank_statement_signature,
+        ),
     )
 
 
@@ -596,20 +679,9 @@ def _parse_bank_ofx(
             check_number = _xml_child_text(transaction, "CHECKNUM")
             amount = parse_money_required(amount_text)
 
-            row_id = _hash_row(
-                [
-                    "bank_ofx",
-                    str(path),
-                    str(index),
-                    posted,
-                    str(amount),
-                    fitid or "",
-                    description,
-                ]
-            )
             rows.append(
                 BankStatementRow(
-                    row_id=row_id,
+                    row_id="",
                     row_number=index,
                     date=row_date,
                     amount=amount,
@@ -655,20 +727,9 @@ def _parse_bank_ofx(
             check_number = _ofx_text_value(block, "CHECKNUM")
             amount = parse_money_required(amount_text)
 
-            row_id = _hash_row(
-                [
-                    "bank_ofx",
-                    str(path),
-                    str(index),
-                    posted,
-                    str(amount),
-                    fitid or "",
-                    description,
-                ]
-            )
             rows.append(
                 BankStatementRow(
-                    row_id=row_id,
+                    row_id="",
                     row_number=index,
                     date=row_date,
                     amount=amount,
@@ -700,7 +761,11 @@ def _parse_bank_ofx(
         account_id=account_id,
         account_name=account_name,
         currency=currency,
-        rows=tuple(rows),
+        rows=_assign_occurrence_row_ids(
+            rows,
+            prefix="bank_ofx",
+            signature_parts=_bank_statement_signature,
+        ),
     )
 
 
@@ -755,7 +820,7 @@ def parse_etsy_statement(
             title = raw["Title"]
             info = raw.get("Info", "")
             row = EtsyStatementRow(
-                row_id=_hash_row(["etsy_statement", str(index), raw.get("Date", ""), row_type, title, info]),
+                row_id="",
                 row_number=index,
                 date=row_date,
                 row_type=row_type,
@@ -772,7 +837,11 @@ def parse_etsy_statement(
             )
             rows.append(row)
 
-    return tuple(rows)
+    return _assign_occurrence_row_ids(
+        rows,
+        prefix="etsy_statement",
+        signature_parts=_etsy_statement_signature,
+    )
 
 
 def parse_etsy_sold_orders(
@@ -792,7 +861,7 @@ def parse_etsy_sold_orders(
 
             order_id = raw["Order ID"].strip()
             row = EtsySoldOrderRow(
-                row_id=_hash_row(["etsy_sold", str(index), order_id, raw.get("Sale Date", "")]),
+                row_id="",
                 row_number=index,
                 sale_date=sale_date,
                 order_id=order_id,
@@ -805,7 +874,11 @@ def parse_etsy_sold_orders(
             )
             rows.append(row)
 
-    return tuple(rows)
+    return _assign_occurrence_row_ids(
+        rows,
+        prefix="etsy_sold",
+        signature_parts=_etsy_sold_order_signature,
+    )
 
 
 def parse_etsy_inputs(
@@ -869,17 +942,7 @@ def parse_ebay_report(
             order_number = None
 
         row = EbayReportRow(
-            row_id=_hash_row(
-                [
-                    "ebay_report",
-                    str(index),
-                    raw.get("Transaction creation date", ""),
-                    raw.get("Type", ""),
-                    raw.get("Order number", ""),
-                    raw.get("Reference ID", ""),
-                    raw.get("Net amount", ""),
-                ]
-            ),
+            row_id="",
             row_number=index,
             date=row_date,
             row_type=raw.get("Type", ""),
@@ -896,4 +959,11 @@ def parse_ebay_report(
         )
         rows.append(row)
 
-    return EbayInputData(report_rows=tuple(rows), fee_columns=fee_columns)
+    return EbayInputData(
+        report_rows=_assign_occurrence_row_ids(
+            rows,
+            prefix="ebay_report",
+            signature_parts=_ebay_report_signature,
+        ),
+        fee_columns=fee_columns,
+    )

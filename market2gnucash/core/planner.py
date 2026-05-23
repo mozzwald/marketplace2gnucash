@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import replace
 from datetime import date
+from pathlib import Path
 
 from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import (
-    AccountRecord,
+    BankCsvProfile,
     BankImportSpec,
     BankStatementData,
-    BankCsvProfile,
     CarryoverCandidate,
+    EtsyMonthlyExport,
     MappingConfig,
     MarketplaceImportSpec,
-    PlanResult,
     PlannedTransaction,
     PlannedTransactionStatus,
+    PlanResult,
     TransferAnchor,
     TransferAnchorResolution,
 )
@@ -27,12 +30,122 @@ from market2gnucash.core.parsers import (
 from market2gnucash.core.rules import (
     build_bank_transactions,
     build_ebay_charge_match_candidates,
-    build_ebay_transactions,
     build_ebay_payout_match_candidates,
+    build_ebay_transactions,
     build_etsy_deposit_match_candidates,
     build_etsy_payment_match_candidates,
     build_etsy_transactions,
 )
+
+_ETSY_STATEMENT_MONTH_RE = re.compile(r"etsy_statement_(\d{4})_(\d{1,2})\.csv$", re.IGNORECASE)
+_ETSY_SOLD_ORDERS_MONTH_RE = re.compile(r"EtsySoldOrders(\d{4})-(\d{1,2})\.csv$", re.IGNORECASE)
+
+
+def _etsy_month_from_statement_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    match = _ETSY_STATEMENT_MONTH_RE.match(Path(path).name)
+    if not match:
+        return None
+    return f"{match.group(1)}-{int(match.group(2)):02d}"
+
+
+def _etsy_month_from_sold_orders_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    match = _ETSY_SOLD_ORDERS_MONTH_RE.match(Path(path).name)
+    if not match:
+        return None
+    return f"{match.group(1)}-{int(match.group(2)):02d}"
+
+
+def _normalize_etsy_monthly_exports(raw_import: dict[str, object]) -> tuple[EtsyMonthlyExport, ...]:
+    raw_exports = raw_import.get("etsy_monthly_exports")
+    exports: list[EtsyMonthlyExport] = []
+    if isinstance(raw_exports, list):
+        for raw_export in raw_exports:
+            if not isinstance(raw_export, dict):
+                continue
+            statement_path = raw_export.get("statement_path")
+            sold_orders_path = raw_export.get("sold_orders_path")
+            exports.append(
+                EtsyMonthlyExport(
+                    statement_path=statement_path if isinstance(statement_path, str) and statement_path else None,
+                    sold_orders_path=sold_orders_path if isinstance(sold_orders_path, str) and sold_orders_path else None,
+                )
+            )
+    if exports:
+        return tuple(exports)
+
+    statement_path = raw_import.get("etsy_statement_path")
+    sold_orders_path = raw_import.get("etsy_sold_orders_path")
+    if isinstance(statement_path, str) or isinstance(sold_orders_path, str):
+        return (
+            EtsyMonthlyExport(
+                statement_path=statement_path if isinstance(statement_path, str) and statement_path else None,
+                sold_orders_path=sold_orders_path if isinstance(sold_orders_path, str) and sold_orders_path else None,
+            ),
+        )
+    return ()
+
+
+def _validate_existing_file(path: str, *, import_label: str, file_label: str) -> None:
+    if not Path(path).is_file():
+        raise ValueError(
+            f"{import_label} references a missing {file_label}: {path}. Reselect the file or restore it before previewing."
+        )
+
+
+def _validate_etsy_exports(marketplace_import: MarketplaceImportSpec) -> tuple[tuple[str, ...], tuple[str, ...], list[str]]:
+    statement_paths: list[str] = []
+    sold_orders_paths: list[str] = []
+    warnings: list[str] = []
+    label = f"Etsy import '{marketplace_import.account_label}'"
+
+    if not marketplace_import.etsy_monthly_exports:
+        raise ValueError(f"{label} requires at least one monthly export pair")
+
+    seen_statement_paths: set[str] = set()
+    seen_sold_orders_paths: set[str] = set()
+    seen_months: set[str] = set()
+    for index, monthly_export in enumerate(marketplace_import.etsy_monthly_exports, start=1):
+        statement_path = monthly_export.statement_path
+        sold_orders_path = monthly_export.sold_orders_path
+        pair_label = f"{label} monthly export #{index}"
+        if not statement_path or not sold_orders_path:
+            missing = []
+            if not statement_path:
+                missing.append("statement CSV")
+            if not sold_orders_path:
+                missing.append("SoldOrders CSV")
+            raise ValueError(f"{pair_label} is missing {', '.join(missing)}")
+
+        _validate_existing_file(statement_path, import_label=pair_label, file_label="statement CSV")
+        _validate_existing_file(sold_orders_path, import_label=pair_label, file_label="SoldOrders CSV")
+
+        statement_paths.append(statement_path)
+        sold_orders_paths.append(sold_orders_path)
+
+        if statement_path in seen_statement_paths:
+            warnings.append(f"WARNING: Duplicate Etsy statement file selected: {statement_path}")
+        seen_statement_paths.add(statement_path)
+        if sold_orders_path in seen_sold_orders_paths:
+            warnings.append(f"WARNING: Duplicate Etsy SoldOrders file selected: {sold_orders_path}")
+        seen_sold_orders_paths.add(sold_orders_path)
+
+        statement_month = _etsy_month_from_statement_path(statement_path)
+        sold_month = _etsy_month_from_sold_orders_path(sold_orders_path)
+        if statement_month and sold_month and statement_month != sold_month:
+            warnings.append(
+                f"WARNING: Etsy monthly export pair #{index} has mismatched months: statement {statement_month}, SoldOrders {sold_month}"
+            )
+        pair_month = statement_month or sold_month
+        if pair_month:
+            if pair_month in seen_months:
+                warnings.append(f"WARNING: More than one Etsy monthly export pair selected for {pair_month}")
+            seen_months.add(pair_month)
+
+    return tuple(statement_paths), tuple(sold_orders_paths), warnings
 
 
 def _status_for_transaction(warnings: tuple[str, ...], is_duplicate: bool) -> tuple[str, str]:
@@ -134,19 +247,17 @@ def build_plan(
                 account_label=account_label,
                 etsy_statement_path=raw_import.get("etsy_statement_path") if isinstance(raw_import.get("etsy_statement_path"), str) else None,
                 etsy_sold_orders_path=raw_import.get("etsy_sold_orders_path") if isinstance(raw_import.get("etsy_sold_orders_path"), str) else None,
+                etsy_monthly_exports=_normalize_etsy_monthly_exports(raw_import),
                 ebay_report_path=raw_import.get("ebay_report_path") if isinstance(raw_import.get("ebay_report_path"), str) else None,
             )
         )
 
     for marketplace_import in normalized_marketplace_imports:
         if marketplace_import.marketplace == "etsy":
-            if not (marketplace_import.etsy_statement_path and marketplace_import.etsy_sold_orders_path):
-                raise ValueError(
-                    f"Etsy import '{marketplace_import.account_label}' requires both statement CSV and SoldOrders CSV"
-                )
+            statement_paths, sold_orders_paths, input_warnings = _validate_etsy_exports(marketplace_import)
             etsy_data = parse_etsy_inputs(
-                statement_path=marketplace_import.etsy_statement_path,
-                sold_orders_path=marketplace_import.etsy_sold_orders_path,
+                statement_path=statement_paths,
+                sold_orders_path=sold_orders_paths,
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -176,11 +287,16 @@ def build_plan(
             )
             all_transactions.extend(etsy_txns)
             all_warnings.extend(
-                f"[{marketplace_import.account_label}] {warning}" for warning in etsy_warnings
+                f"[{marketplace_import.account_label}] {warning}" for warning in [*input_warnings, *etsy_warnings]
             )
         elif marketplace_import.marketplace == "ebay":
             if not marketplace_import.ebay_report_path:
                 raise ValueError(f"eBay import '{marketplace_import.account_label}' requires a transaction report CSV")
+            _validate_existing_file(
+                marketplace_import.ebay_report_path,
+                import_label=f"eBay import '{marketplace_import.account_label}'",
+                file_label="transaction report CSV",
+            )
             ebay_data = parse_ebay_report(
                 marketplace_import.ebay_report_path,
                 start_date=start_date,
@@ -224,7 +340,11 @@ def build_plan(
     }
     current_candidate_resolution_keys = {
         transaction.dedupe_key: candidate.candidate_key
-        for transaction, candidate in zip(marketplace_payout_candidates, current_carryover_candidates)
+        for transaction, candidate in zip(
+            marketplace_payout_candidates,
+            current_carryover_candidates,
+            strict=True,
+        )
     }
     pending_carryover_candidates = tuple(
         candidate
@@ -254,6 +374,12 @@ def build_plan(
             if not statement_paths:
                 all_warnings.append(
                     f"INFO: Bank/Card import bundle for account {account_guid or '(unselected)'} has no statement files"
+                )
+            for statement_path in statement_paths:
+                _validate_existing_file(
+                    statement_path,
+                    import_label=f"Bank/Card import bundle for account {account_guid or '(unselected)'}",
+                    file_label="statement file",
                 )
             spec = BankImportSpec(
                 account_guid=account_guid if isinstance(account_guid, str) else None,
@@ -329,10 +455,22 @@ def build_plan(
 
     dedupe_keys = [txn.dedupe_key for txn in all_transactions]
     existing = dedupe_store.existing_keys(book_id, dedupe_keys)
+    duplicate_in_plan_keys = {
+        key for key, count in Counter(dedupe_keys).items() if count > 1
+    }
+    if duplicate_in_plan_keys:
+        all_warnings.append(
+            f"WARNING: Duplicate planned transaction keys found in selected inputs: {', '.join(sorted(duplicate_in_plan_keys))}"
+        )
 
     statuses: list[PlannedTransactionStatus] = []
+    seen_plan_keys: set[str] = set()
     for txn in sorted(all_transactions, key=lambda value: (value.date, value.marketplace, value.txn_kind, value.txn_id)):
-        status, reason = _status_for_transaction(txn.warnings, txn.dedupe_key in existing)
+        duplicate_in_selected_inputs = txn.dedupe_key in seen_plan_keys
+        seen_plan_keys.add(txn.dedupe_key)
+        status, reason = _status_for_transaction(txn.warnings, txn.dedupe_key in existing or duplicate_in_selected_inputs)
+        if duplicate_in_selected_inputs and status == "duplicate":
+            reason = "Duplicate in selected inputs"
         statuses.append(
             PlannedTransactionStatus(transaction=txn, status=status, status_reason=reason)
         )

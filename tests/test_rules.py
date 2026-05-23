@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import tempfile
+import unittest
 from collections import Counter
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-import tempfile
-import unittest
 
 from market2gnucash.core.models import (
     BankImportSpec,
@@ -18,19 +18,22 @@ from market2gnucash.core.models import (
     PlannedTransaction,
     TransferAnchor,
 )
-from market2gnucash.core.parsers import parse_bank_statement_file, parse_ebay_report, parse_etsy_inputs
+from market2gnucash.core.parsers import (
+    parse_bank_statement_file,
+    parse_ebay_report,
+    parse_etsy_inputs,
+)
 from market2gnucash.core.rules import (
     bank_merchant_key,
     build_bank_transactions,
     build_ebay_charge_match_candidates,
-    build_ebay_transactions,
     build_ebay_payout_match_candidates,
+    build_ebay_transactions,
     build_etsy_deposit_match_candidates,
     build_etsy_payment_match_candidates,
     build_etsy_transactions,
     ebay_standalone_fee_mapping_key,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"

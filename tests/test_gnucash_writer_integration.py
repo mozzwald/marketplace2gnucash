@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 import tempfile
+import unittest
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-import unittest
 
 from market2gnucash.core.gnucash_writer import GnuCashWriter
 from market2gnucash.core.models import PlannedSplit, PlannedTransaction

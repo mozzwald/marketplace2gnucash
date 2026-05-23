@@ -234,7 +234,7 @@ class CsvProfileDialog(QDialog):
                 combo.addItem(_column_label(column, sample_value), column)
             combo.blockSignals(False)
 
-        for combo, value in zip(combos, previous_values):
+        for combo, value in zip(combos, previous_values, strict=True):
             combo_index = combo.findData(value)
             if combo_index >= 0:
                 combo.setCurrentIndex(combo_index)

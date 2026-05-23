@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from market2gnucash.core.config_store import ConfigStore
 from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping
@@ -48,6 +48,39 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertIsNone(store.load_last_book_path())
             self.assertEqual(store.load_inputs("book-a"), {})
             self.assertEqual(store.load_inputs("book-b"), {})
+
+    def test_load_inputs_migrates_legacy_etsy_paths_to_monthly_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(path)
+            store.save_inputs(
+                "book-a",
+                {
+                    "marketplace_imports": [
+                        {
+                            "marketplace": "etsy",
+                            "account_key": "etsy:shop-a",
+                            "account_label": "Shop A",
+                            "etsy_statement_path": "/exports/etsy_statement_2026_4.csv",
+                            "etsy_sold_orders_path": "/exports/EtsySoldOrders2026-4.csv",
+                        }
+                    ]
+                },
+            )
+
+            inputs = store.load_inputs("book-a")
+
+        marketplace_import = inputs["marketplace_imports"][0]
+        self.assertEqual(marketplace_import["account_key"], "etsy:shop-a")
+        self.assertEqual(
+            marketplace_import["etsy_monthly_exports"],
+            [
+                {
+                    "statement_path": "/exports/etsy_statement_2026_4.csv",
+                    "sold_orders_path": "/exports/EtsySoldOrders2026-4.csv",
+                }
+            ],
+        )
 
     def test_account_scoped_marketplace_mapping_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

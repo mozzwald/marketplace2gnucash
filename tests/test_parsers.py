@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from decimal import Decimal
-from pathlib import Path
 import tempfile
 import unittest
+from decimal import Decimal
+from pathlib import Path
 
+from market2gnucash.core.models import BankCsvProfile
 from market2gnucash.core.parsers import (
     parse_bank_statement_file,
     parse_ebay_report,
     parse_etsy_inputs,
     parse_etsy_statement,
 )
-from market2gnucash.core.models import BankCsvProfile
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"

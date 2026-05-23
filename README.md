@@ -32,10 +32,16 @@ Cross-platform Python 3.11+ desktop GUI (PySide6) to import Etsy/eBay marketplac
 
 ### Etsy
 
-Both files are required:
+Add one monthly export pair for every Etsy month that can contribute rows to the preview/import window. Each pair requires:
 
 1. `etsy_statement_YYYY_M.csv`
 2. `EtsySoldOrdersYYYY-M.csv`
+
+Recommended workflow:
+
+- Keep stable monthly filenames and overwrite/refresh the current month files as Etsy updates them.
+- When a weekly import spans a month boundary, include both monthly export pairs in the same Etsy account input.
+- If selected files are renamed or moved, reselect them before previewing. Directory detection can rebuild the monthly export list from files that still use Etsy's standard filenames.
 
 ### eBay
 

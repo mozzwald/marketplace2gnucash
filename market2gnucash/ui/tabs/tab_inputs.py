@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -10,10 +11,11 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QDialog,
     QFileDialog,
-    QFrame,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -28,6 +30,9 @@ from market2gnucash.core.models import AccountRecord
 from market2gnucash.core.parsers import bank_csv_profile_to_dict
 from market2gnucash.ui.account_picker import AccountPickerDialog
 from market2gnucash.ui.csv_profile_dialog import CsvProfileDialog
+
+_ETSY_STATEMENT_MONTH_RE = re.compile(r"etsy_statement_(\d{4})_(\d{1,2})\.csv$", re.IGNORECASE)
+_ETSY_SOLD_ORDERS_MONTH_RE = re.compile(r"EtsySoldOrders(\d{4})-(\d{1,2})\.csv$", re.IGNORECASE)
 
 
 class InputsTab(QWidget):
@@ -156,6 +161,7 @@ class InputsTab(QWidget):
             account_label = item.get("account_label") if isinstance(item.get("account_label"), str) else ""
             if not marketplace or marketplace not in {"etsy", "ebay"} or not account_key or not import_id:
                 continue
+            etsy_monthly_exports = self._normalized_etsy_monthly_exports(item)
             normalized.append(
                 {
                     "import_id": import_id,
@@ -164,10 +170,40 @@ class InputsTab(QWidget):
                     "account_label": account_label,
                     "etsy_statement_path": item.get("etsy_statement_path") if isinstance(item.get("etsy_statement_path"), str) else None,
                     "etsy_sold_orders_path": item.get("etsy_sold_orders_path") if isinstance(item.get("etsy_sold_orders_path"), str) else None,
+                    "etsy_monthly_exports": etsy_monthly_exports,
                     "ebay_report_path": item.get("ebay_report_path") if isinstance(item.get("ebay_report_path"), str) else None,
                 }
             )
         return normalized
+
+    def _normalized_etsy_monthly_exports(self, item: dict[str, object]) -> list[dict[str, str | None]]:
+        raw_exports = item.get("etsy_monthly_exports")
+        exports: list[dict[str, str | None]] = []
+        if isinstance(raw_exports, list):
+            for raw_export in raw_exports:
+                if not isinstance(raw_export, dict):
+                    continue
+                statement_path = raw_export.get("statement_path")
+                sold_orders_path = raw_export.get("sold_orders_path")
+                exports.append(
+                    {
+                        "statement_path": statement_path if isinstance(statement_path, str) and statement_path else None,
+                        "sold_orders_path": sold_orders_path if isinstance(sold_orders_path, str) and sold_orders_path else None,
+                    }
+                )
+        if exports:
+            return exports
+
+        statement_path = item.get("etsy_statement_path")
+        sold_orders_path = item.get("etsy_sold_orders_path")
+        if isinstance(statement_path, str) or isinstance(sold_orders_path, str):
+            return [
+                {
+                    "statement_path": statement_path if isinstance(statement_path, str) and statement_path else None,
+                    "sold_orders_path": sold_orders_path if isinstance(sold_orders_path, str) and sold_orders_path else None,
+                }
+            ]
+        return []
 
     def _set_marketplace_imports(self, imports: list[dict[str, object]]) -> None:
         inputs = dict(self.app_state.get("inputs", {}))
@@ -185,6 +221,7 @@ class InputsTab(QWidget):
                 "account_label": f"{'Etsy' if marketplace == 'etsy' else 'eBay'} Account {len(marketplace_imports) + 1}",
                 "etsy_statement_path": None,
                 "etsy_sold_orders_path": None,
+                "etsy_monthly_exports": [],
                 "ebay_report_path": None,
             }
         )
@@ -205,14 +242,7 @@ class InputsTab(QWidget):
             self.marketplace_imports_table.setCellWidget(row_index, 1, name_edit)
 
             if marketplace == "etsy":
-                file_parts = [
-                    f"Statement: {Path(path).name}" if path else "Statement: (none)"
-                    for path in [marketplace_import.get("etsy_statement_path")]
-                ]
-                file_parts.extend(
-                    f"Sold Orders: {Path(path).name}" if path else "Sold Orders: (none)"
-                    for path in [marketplace_import.get("etsy_sold_orders_path")]
-                )
+                file_parts = self._etsy_file_parts(marketplace_import)
             else:
                 report_path = marketplace_import.get("ebay_report_path")
                 file_parts = [f"Report: {Path(report_path).name}" if report_path else "Report: (none)"]
@@ -222,16 +252,21 @@ class InputsTab(QWidget):
             actions_layout = QHBoxLayout(actions_widget)
             actions_layout.setContentsMargins(0, 0, 0, 0)
             if marketplace == "etsy":
-                statement_button = QPushButton("Statement CSV")
-                statement_button.clicked.connect(
-                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "etsy_statement_path", "Select Etsy Statement CSV")
+                add_pair_button = QPushButton("Add Month Pair")
+                add_pair_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._add_etsy_monthly_pair(idx)
                 )
-                sold_orders_button = QPushButton("Sold Orders CSV")
-                sold_orders_button.clicked.connect(
-                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "etsy_sold_orders_path", "Select Etsy Sold Orders CSV")
+                detect_button = QPushButton("Detect Directory")
+                detect_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._detect_etsy_monthly_pairs(idx)
                 )
-                actions_layout.addWidget(statement_button)
-                actions_layout.addWidget(sold_orders_button)
+                remove_pair_button = QPushButton("Remove Month")
+                remove_pair_button.clicked.connect(
+                    lambda _checked=False, idx=row_index: self._remove_etsy_monthly_pair(idx)
+                )
+                actions_layout.addWidget(add_pair_button)
+                actions_layout.addWidget(detect_button)
+                actions_layout.addWidget(remove_pair_button)
             else:
                 report_button = QPushButton("Report CSV")
                 report_button.clicked.connect(
@@ -254,6 +289,37 @@ class InputsTab(QWidget):
 
         self.marketplace_imports_table.resizeColumnsToContents()
 
+    def _etsy_file_parts(self, marketplace_import: dict[str, object]) -> list[str]:
+        exports = [
+            export
+            for export in marketplace_import.get("etsy_monthly_exports", [])
+            if isinstance(export, dict)
+        ]
+        if not exports:
+            return ["(no monthly exports selected)"]
+        parts: list[str] = []
+        for index, export in enumerate(exports, start=1):
+            statement_path = export.get("statement_path")
+            sold_orders_path = export.get("sold_orders_path")
+            statement_label = Path(statement_path).name if isinstance(statement_path, str) and statement_path else "(missing statement)"
+            sold_label = Path(sold_orders_path).name if isinstance(sold_orders_path, str) and sold_orders_path else "(missing SoldOrders)"
+            month = self._etsy_month_label(statement_path if isinstance(statement_path, str) else None) or self._etsy_month_label(sold_orders_path if isinstance(sold_orders_path, str) else None)
+            prefix = month or f"Pair {index}"
+            parts.append(f"{prefix}: {statement_label} / {sold_label}")
+        return parts
+
+    def _etsy_month_label(self, path: str | None) -> str | None:
+        if not path:
+            return None
+        name = Path(path).name
+        statement_match = _ETSY_STATEMENT_MONTH_RE.match(name)
+        if statement_match:
+            return f"{statement_match.group(1)}-{int(statement_match.group(2)):02d}"
+        sold_match = _ETSY_SOLD_ORDERS_MONTH_RE.match(name)
+        if sold_match:
+            return f"{sold_match.group(1)}-{int(sold_match.group(2)):02d}"
+        return None
+
     def _rename_marketplace_import(self, row_index: int, account_label: str) -> None:
         marketplace_imports = self._marketplace_imports()
         if row_index >= len(marketplace_imports):
@@ -274,6 +340,96 @@ class InputsTab(QWidget):
         marketplace_imports[row_index][field_name] = file_path
         self._set_marketplace_imports(marketplace_imports)
 
+    def _add_etsy_monthly_pair(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        statement_path, _ = QFileDialog.getOpenFileName(self, "Select Etsy Statement CSV", "", "CSV Files (*.csv)")
+        if not statement_path:
+            return
+        sold_orders_path, _ = QFileDialog.getOpenFileName(self, "Select Etsy SoldOrders CSV", str(Path(statement_path).parent), "CSV Files (*.csv)")
+        if not sold_orders_path:
+            return
+        exports = list(marketplace_imports[row_index].get("etsy_monthly_exports", []))
+        exports.append({"statement_path": statement_path, "sold_orders_path": sold_orders_path})
+        marketplace_imports[row_index]["etsy_monthly_exports"] = exports
+        self._sync_legacy_etsy_paths(marketplace_imports[row_index])
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _detect_etsy_monthly_pairs(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Select Etsy Export Directory", "")
+        if not directory:
+            return
+        exports, warnings = self._detect_etsy_exports_in_directory(Path(directory))
+        if not exports:
+            QMessageBox.warning(self, "No Etsy Exports", "No matching Etsy monthly export files were found.")
+            return
+        marketplace_imports[row_index]["etsy_monthly_exports"] = exports
+        self._sync_legacy_etsy_paths(marketplace_imports[row_index])
+        self._set_marketplace_imports(marketplace_imports)
+        if warnings:
+            QMessageBox.warning(self, "Etsy Export Warnings", "\n".join(warnings))
+
+    def _detect_etsy_exports_in_directory(self, directory: Path) -> tuple[list[dict[str, str | None]], list[str]]:
+        statements: dict[str, str] = {}
+        sold_orders: dict[str, str] = {}
+        for path in directory.iterdir():
+            if not path.is_file():
+                continue
+            statement_match = _ETSY_STATEMENT_MONTH_RE.match(path.name)
+            if statement_match:
+                statements[f"{statement_match.group(1)}-{int(statement_match.group(2)):02d}"] = str(path)
+                continue
+            sold_match = _ETSY_SOLD_ORDERS_MONTH_RE.match(path.name)
+            if sold_match:
+                sold_orders[f"{sold_match.group(1)}-{int(sold_match.group(2)):02d}"] = str(path)
+
+        exports: list[dict[str, str | None]] = []
+        warnings: list[str] = []
+        for month in sorted(set(statements) | set(sold_orders)):
+            statement_path = statements.get(month)
+            sold_orders_path = sold_orders.get(month)
+            if not statement_path:
+                warnings.append(f"{month}: SoldOrders found but statement CSV is missing")
+            if not sold_orders_path:
+                warnings.append(f"{month}: statement CSV found but SoldOrders CSV is missing")
+            exports.append({"statement_path": statement_path, "sold_orders_path": sold_orders_path})
+        return exports, warnings
+
+    def _remove_etsy_monthly_pair(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        exports = [
+            export
+            for export in marketplace_imports[row_index].get("etsy_monthly_exports", [])
+            if isinstance(export, dict)
+        ]
+        if not exports:
+            return
+        labels = self._etsy_file_parts(marketplace_imports[row_index])
+        selected, accepted = QInputDialog.getItem(self, "Remove Etsy Month", "Monthly export", labels, 0, False)
+        if not accepted:
+            return
+        selected_index = labels.index(selected)
+        del exports[selected_index]
+        marketplace_imports[row_index]["etsy_monthly_exports"] = exports
+        self._sync_legacy_etsy_paths(marketplace_imports[row_index])
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _sync_legacy_etsy_paths(self, marketplace_import: dict[str, object]) -> None:
+        exports = [
+            export
+            for export in marketplace_import.get("etsy_monthly_exports", [])
+            if isinstance(export, dict)
+        ]
+        first = exports[0] if exports else {}
+        marketplace_import["etsy_statement_path"] = first.get("statement_path") if isinstance(first.get("statement_path"), str) else None
+        marketplace_import["etsy_sold_orders_path"] = first.get("sold_orders_path") if isinstance(first.get("sold_orders_path"), str) else None
+
     def _clear_marketplace_files(self, row_index: int) -> None:
         marketplace_imports = self._marketplace_imports()
         if row_index >= len(marketplace_imports):
@@ -282,6 +438,7 @@ class InputsTab(QWidget):
         if marketplace == "etsy":
             marketplace_imports[row_index]["etsy_statement_path"] = None
             marketplace_imports[row_index]["etsy_sold_orders_path"] = None
+            marketplace_imports[row_index]["etsy_monthly_exports"] = []
         else:
             marketplace_imports[row_index]["ebay_report_path"] = None
         self._set_marketplace_imports(marketplace_imports)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -106,7 +106,7 @@ class DedupeStore:
     def mark_imported(self, book_id: str, dedupe_keys: list[str]) -> None:
         if not dedupe_keys:
             return
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO imports (book_id, dedupe_key, imported_at) VALUES (?, ?, ?)",
@@ -117,7 +117,7 @@ class DedupeStore:
     def add_pending_transfer_anchors(self, book_id: str, anchors: list[TransferAnchor] | tuple[TransferAnchor, ...]) -> None:
         if not anchors:
             return
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.executemany(
                 """
@@ -201,7 +201,7 @@ class DedupeStore:
     ) -> None:
         if not resolutions:
             return
-        resolved_at = datetime.now(timezone.utc).isoformat()
+        resolved_at = datetime.now(UTC).isoformat()
         counterpart_keys = [resolution.counterpart_dedupe_key for resolution in resolutions]
         with self._connect() as conn:
             conn.executemany(

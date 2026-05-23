@@ -8,7 +8,6 @@ from xml.etree import ElementTree as ET
 
 from market2gnucash.core.models import AccountRecord, BookInfo
 
-
 _LOCK_SUFFIXES = (".LCK", ".LNK", ".lock")
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -50,7 +50,7 @@ class CarryoverStore:
     def upsert_pending_candidates(self, book_id: str, candidates: tuple[CarryoverCandidate, ...] | list[CarryoverCandidate]) -> None:
         if not candidates:
             return
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
         rows = [
             (
                 book_id,
@@ -124,7 +124,7 @@ class CarryoverStore:
     def resolve_candidates(self, book_id: str, candidate_keys: list[str] | tuple[str, ...]) -> None:
         if not candidate_keys:
             return
-        resolved_at = datetime.now(timezone.utc).isoformat()
+        resolved_at = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.executemany(
                 """

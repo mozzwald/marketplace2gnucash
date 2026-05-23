@@ -8,8 +8,8 @@ from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.config_store import ConfigStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import MappingConfig
-from market2gnucash.ui.tabs.tab_book import BookTab
 from market2gnucash.ui.tabs.tab_bank_mapping import BankMappingTab
+from market2gnucash.ui.tabs.tab_book import BookTab
 from market2gnucash.ui.tabs.tab_import import ImportTab
 from market2gnucash.ui.tabs.tab_inputs import InputsTab
 from market2gnucash.ui.tabs.tab_mapping import MappingTab

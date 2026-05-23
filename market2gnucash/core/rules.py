@@ -1,21 +1,20 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-import re
 
 from market2gnucash.core.decimal_utils import ZERO, parse_money
 from market2gnucash.core.models import (
     BankCategoryResult,
+    BankImportSpec,
     BankMatchResult,
     BankMatchTarget,
-    TransferAnchor,
-    BankTransferResult,
-    BankImportSpec,
     BankStatementData,
+    BankTransferResult,
     EbayInputData,
     EbayReportRow,
     EtsyInputData,
@@ -24,6 +23,7 @@ from market2gnucash.core.models import (
     MarketplaceAccountMapping,
     PlannedSplit,
     PlannedTransaction,
+    TransferAnchor,
 )
 
 _BANK_NOISE_TOKENS = {
@@ -1136,7 +1136,6 @@ def build_bank_transactions(
                     )
                 )
 
-    rows_by_key = {row.dedupe_key: row for row in bank_rows}
     match_by_key: dict[str, BankMatchResult] = {}
     for row in bank_rows:
         match_result = _find_marketplace_match(

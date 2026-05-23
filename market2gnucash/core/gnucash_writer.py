@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable
 
 from market2gnucash.core.models import PlannedSplit, PlannedTransaction
 

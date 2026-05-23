@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,12 @@ class BankImportSpec:
 
 
 @dataclass(frozen=True)
+class EtsyMonthlyExport:
+    statement_path: str | None = None
+    sold_orders_path: str | None = None
+
+
+@dataclass(frozen=True)
 class MarketplaceImportSpec:
     import_id: str
     marketplace: str
@@ -145,6 +152,7 @@ class MarketplaceImportSpec:
     account_label: str
     etsy_statement_path: str | None = None
     etsy_sold_orders_path: str | None = None
+    etsy_monthly_exports: tuple[EtsyMonthlyExport, ...] = ()
     ebay_report_path: str | None = None
 
 
@@ -159,7 +167,7 @@ class CsvPreviewData:
 
 @dataclass(frozen=True)
 class MappingConfig:
-    marketplace_accounts: Mapping[str, "MarketplaceAccountMapping"] = field(default_factory=dict)
+    marketplace_accounts: Mapping[str, MarketplaceAccountMapping] = field(default_factory=dict)
     bank_match_overrides: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     bank_transfer_overrides: Mapping[str, str] = field(default_factory=dict)
     bank_merchant_accounts: Mapping[str, str] = field(default_factory=dict)

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import tempfile
+import unittest
 from datetime import date
 from decimal import Decimal
-import tempfile
 from pathlib import Path
-import unittest
 
 from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping, TransferAnchor
 from market2gnucash.core.planner import build_plan
 from market2gnucash.core.rules import bank_merchant_key, ebay_standalone_fee_mapping_key
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "sample_imports"
@@ -20,6 +19,208 @@ AMM_SAMPLES = SAMPLES / "Etsy-AMM"
 
 
 class PlannerTests(unittest.TestCase):
+    def _etsy_mapping(self) -> MappingConfig:
+        return MappingConfig(
+            marketplace_accounts={
+                "etsy:shop-a": MarketplaceAccountMapping(
+                    marketplace="etsy",
+                    account_label="Shop A",
+                    clearing_guid="guid-asset-etsy",
+                    income_guid="guid-income-etsy",
+                    refunds_guid="guid-refunds-etsy",
+                    fee_accounts={"etsy:Fee:Listing fee": "guid-exp-listing"},
+                )
+            }
+        )
+
+    def _etsy_import(self, exports: list[dict[str, str | None]]) -> dict[str, object]:
+        return {
+            "import_id": "import-a",
+            "marketplace": "etsy",
+            "account_key": "etsy:shop-a",
+            "account_label": "Shop A",
+            "etsy_monthly_exports": exports,
+        }
+
+    def _write_etsy_exports(
+        self,
+        directory: Path,
+        *,
+        year: int,
+        month: int,
+        order_ids: list[str],
+    ) -> tuple[Path, Path]:
+        statement_path = directory / f"etsy_statement_{year}_{month}.csv"
+        sold_orders_path = directory / f"EtsySoldOrders{year}-{month}.csv"
+        statement_rows = ["Date,Type,Title,Info,Currency,Amount,Fees & Taxes,Net,Tax Details"]
+        sold_order_rows = ["Sale Date,Order ID,Currency,Order Value,Shipping,Sales Tax,Order Total"]
+        for index, order_id in enumerate(order_ids, start=1):
+            day = min(index, 28)
+            statement_rows.append(
+                f'{month:02d}/{day:02d}/{year},Sale,"Payment for Order #{order_id}",,USD,25.00,,25.00,'
+            )
+            sold_order_rows.append(f"{month:02d}/{day:02d}/{year},{order_id},USD,25.00,0.00,0.00,25.00")
+        statement_path.write_text("\n".join(statement_rows), encoding="utf-8")
+        sold_orders_path.write_text("\n".join(sold_order_rows), encoding="utf-8")
+        return statement_path, sold_orders_path
+
+    def test_refreshed_etsy_monthly_exports_mark_old_rows_duplicate_and_new_rows_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            statement_path, sold_orders_path = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=4,
+                order_ids=["1001"],
+            )
+
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=self._etsy_mapping(),
+                marketplace_imports=[
+                    self._etsy_import([{"statement_path": str(statement_path), "sold_orders_path": str(sold_orders_path)}])
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+            first_sales = [row for row in first_plan.transactions if row.transaction.txn_kind == "sale"]
+            self.assertEqual(len(first_sales), 1)
+            self.assertEqual(first_sales[0].status, "ready")
+            dedupe_store.mark_imported("book-1", [row.transaction.dedupe_key for row in first_sales])
+
+            self._write_etsy_exports(tmp_path, year=2026, month=4, order_ids=["1001", "1002"])
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=self._etsy_mapping(),
+                marketplace_imports=[
+                    self._etsy_import([{"statement_path": str(statement_path), "sold_orders_path": str(sold_orders_path)}])
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+            second_sales = [row for row in second_plan.transactions if row.transaction.txn_kind == "sale"]
+            self.assertEqual(len(second_sales), 2)
+            self.assertEqual({row.transaction.external_ref: row.status for row in second_sales}, {"1001": "duplicate", "1002": "ready"})
+
+    def test_etsy_week_month_boundary_accepts_two_monthly_export_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            january_statement, january_sold = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=1,
+                order_ids=["101"],
+            )
+            february_statement, february_sold = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=2,
+                order_ids=["201"],
+            )
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=CarryoverStore(db_path),
+                mapping=self._etsy_mapping(),
+                marketplace_imports=[
+                    self._etsy_import(
+                        [
+                            {"statement_path": str(january_statement), "sold_orders_path": str(january_sold)},
+                            {"statement_path": str(february_statement), "sold_orders_path": str(february_sold)},
+                        ]
+                    )
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+
+        sales = [row.transaction for row in plan.transactions if row.transaction.txn_kind == "sale"]
+        self.assertEqual({sale.external_ref for sale in sales}, {"101", "201"})
+
+    def test_build_plan_reports_stale_etsy_file_path_without_raw_file_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            _statement_path, sold_orders_path = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=4,
+                order_ids=["1001"],
+            )
+            missing_statement = tmp_path / "etsy_statement_2026_4_missing.csv"
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Etsy import 'Shop A' monthly export #1 references a missing statement CSV",
+            ):
+                build_plan(
+                    book_id="book-1",
+                    dedupe_store=DedupeStore(db_path),
+                    carryover_store=CarryoverStore(db_path),
+                    mapping=self._etsy_mapping(),
+                    marketplace_imports=[
+                        self._etsy_import(
+                            [{"statement_path": str(missing_statement), "sold_orders_path": str(sold_orders_path)}]
+                        )
+                    ],
+                    bank_imports=[],
+                    start_date=None,
+                    end_date=None,
+                )
+
+    def test_build_plan_warns_for_mismatched_and_duplicate_etsy_monthly_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            april_statement, april_sold = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=4,
+                order_ids=["1001"],
+            )
+            may_statement, _may_sold = self._write_etsy_exports(
+                tmp_path,
+                year=2026,
+                month=5,
+                order_ids=["1002"],
+            )
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=CarryoverStore(db_path),
+                mapping=self._etsy_mapping(),
+                marketplace_imports=[
+                    self._etsy_import(
+                        [
+                            {"statement_path": str(april_statement), "sold_orders_path": str(april_sold)},
+                            {"statement_path": str(may_statement), "sold_orders_path": str(april_sold)},
+                            {"statement_path": str(april_statement), "sold_orders_path": str(april_sold)},
+                        ]
+                    )
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+
+        warnings = "\n".join(plan.warnings)
+        self.assertIn("mismatched months: statement 2026-05, SoldOrders 2026-04", warnings)
+        self.assertIn("Duplicate Etsy statement file selected", warnings)
+        self.assertIn("Duplicate Etsy SoldOrders file selected", warnings)
+
     def test_build_plan_supports_multiple_marketplace_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             dedupe_store = DedupeStore(Path(tmp_dir) / "dedupe.sqlite3")

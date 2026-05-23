@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
-
 ZERO = Decimal("0")
 
 

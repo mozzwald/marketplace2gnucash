@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QComboBox,
@@ -20,7 +21,11 @@ from PySide6.QtWidgets import (
 
 from market2gnucash.core.models import AccountRecord, MappingConfig, MarketplaceAccountMapping
 from market2gnucash.core.parsers import parse_ebay_report, parse_etsy_statement
-from market2gnucash.core.rules import ebay_mapping_key, ebay_standalone_fee_mapping_key, etsy_mapping_key
+from market2gnucash.core.rules import (
+    ebay_mapping_key,
+    ebay_standalone_fee_mapping_key,
+    etsy_mapping_key,
+)
 from market2gnucash.ui.account_picker import AccountPickerDialog
 
 
@@ -126,10 +131,10 @@ class MappingTab(QWidget):
             account = accounts_by_guid.get(guid) if guid else None
             label.setText(account.full_name if account else "(not selected)")
 
-        mapping_keys = set(self.app_state.get("marketplace_mapping_keys", {}).get(active_import["account_key"], ()))
+        mapping_keys = set(self.app_state.get("marketplace_mapping_keys", {}).get(str(active_import["account_key"]), ()))
         plan = self.app_state.get("plan_result")
         if plan is not None:
-            mapping_keys.update(plan.marketplace_mapping_keys.get(active_import["account_key"], ()))
+            mapping_keys.update(plan.marketplace_mapping_keys.get(str(active_import["account_key"]), ()))
 
         if active_import["marketplace"] == "etsy":
             self.fee_label.setText("Etsy Fee Mapping")
@@ -140,10 +145,10 @@ class MappingTab(QWidget):
             self.fee_table.setHorizontalHeaderLabels(["eBay Fee Column", "Account", "Action"])
             self._populate_fee_table(sorted(mapping_keys), account_mapping)
 
-    def _marketplace_imports(self) -> list[dict[str, str]]:
+    def _marketplace_imports(self) -> list[dict[str, object]]:
         inputs = self.app_state.get("inputs", {})
         imports = inputs.get("marketplace_imports", [])
-        normalized: list[dict[str, str]] = []
+        normalized: list[dict[str, object]] = []
         for item in imports:
             if not isinstance(item, dict):
                 continue
@@ -151,12 +156,37 @@ class MappingTab(QWidget):
             account_key = item.get("account_key")
             account_label = item.get("account_label")
             if all(isinstance(value, str) and value for value in (marketplace, account_key, account_label)):
+                etsy_monthly_exports: list[dict[str, str]] = []
+                raw_exports = item.get("etsy_monthly_exports")
+                if isinstance(raw_exports, list):
+                    for raw_export in raw_exports:
+                        if not isinstance(raw_export, dict):
+                            continue
+                        statement_path = raw_export.get("statement_path")
+                        sold_orders_path = raw_export.get("sold_orders_path")
+                        etsy_monthly_exports.append(
+                            {
+                                "statement_path": statement_path if isinstance(statement_path, str) else "",
+                                "sold_orders_path": sold_orders_path if isinstance(sold_orders_path, str) else "",
+                            }
+                        )
+                if not etsy_monthly_exports:
+                    statement_path = item.get("etsy_statement_path")
+                    sold_orders_path = item.get("etsy_sold_orders_path")
+                    if isinstance(statement_path, str) or isinstance(sold_orders_path, str):
+                        etsy_monthly_exports.append(
+                            {
+                                "statement_path": statement_path if isinstance(statement_path, str) else "",
+                                "sold_orders_path": sold_orders_path if isinstance(sold_orders_path, str) else "",
+                            }
+                        )
                 normalized.append(
                     {
                         "marketplace": marketplace,
                         "account_key": account_key,
                         "account_label": account_label,
                         "etsy_statement_path": item.get("etsy_statement_path") if isinstance(item.get("etsy_statement_path"), str) else "",
+                        "etsy_monthly_exports": etsy_monthly_exports,
                         "ebay_report_path": item.get("ebay_report_path") if isinstance(item.get("ebay_report_path"), str) else "",
                     }
                 )
@@ -166,7 +196,7 @@ class MappingTab(QWidget):
         value = self.account_selector.currentData()
         return value if isinstance(value, str) and value else None
 
-    def _active_marketplace_import(self) -> dict[str, str] | None:
+    def _active_marketplace_import(self) -> dict[str, object] | None:
         selected_key = self._selected_account_key()
         for marketplace_import in self._marketplace_imports():
             if marketplace_import["account_key"] == selected_key:
@@ -177,13 +207,13 @@ class MappingTab(QWidget):
     def _account_mapping(
         self,
         mapping: MappingConfig,
-        marketplace_import: dict[str, str],
+        marketplace_import: dict[str, object],
     ) -> MarketplaceAccountMapping:
         return mapping.marketplace_accounts.get(
-            marketplace_import["account_key"],
+            str(marketplace_import["account_key"]),
             MarketplaceAccountMapping(
-                marketplace=marketplace_import["marketplace"],
-                account_label=marketplace_import["account_label"],
+                marketplace=str(marketplace_import["marketplace"]),
+                account_label=str(marketplace_import["account_label"]),
             ),
         )
 
@@ -197,28 +227,44 @@ class MappingTab(QWidget):
         try:
             for marketplace_import in self._marketplace_imports():
                 found_keys: set[str] = set()
-                if marketplace_import["marketplace"] == "etsy" and marketplace_import["etsy_statement_path"]:
-                    statement_rows = parse_etsy_statement(
-                        marketplace_import["etsy_statement_path"],
-                        start_date,
-                        end_date,
-                    )
-                    for row in statement_rows:
-                        if row.row_type != "Fee":
-                            continue
-                        found_keys.add(etsy_mapping_key(row))
-                        if row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
-                            found_keys.add("etsy:Fee:Transaction fee:*")
+                if marketplace_import["marketplace"] == "etsy":
+                    exports = marketplace_import.get("etsy_monthly_exports", [])
+                    if isinstance(exports, list):
+                        for export in exports:
+                            if not isinstance(export, dict):
+                                continue
+                            statement_path = export.get("statement_path")
+                            if not isinstance(statement_path, str) or not statement_path:
+                                continue
+                            if not Path(statement_path).is_file():
+                                raise ValueError(
+                                    f"Etsy import '{marketplace_import['account_label']}' references a missing statement CSV: {statement_path}. Reselect the file or restore it before scanning."
+                                )
+                            statement_rows = parse_etsy_statement(
+                                statement_path,
+                                start_date,
+                                end_date,
+                            )
+                            for row in statement_rows:
+                                if row.row_type != "Fee":
+                                    continue
+                                found_keys.add(etsy_mapping_key(row))
+                                if row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
+                                    found_keys.add("etsy:Fee:Transaction fee:*")
                 if marketplace_import["marketplace"] == "ebay" and marketplace_import["ebay_report_path"]:
+                    if not Path(str(marketplace_import["ebay_report_path"])).is_file():
+                        raise ValueError(
+                            f"eBay import '{marketplace_import['account_label']}' references a missing transaction report CSV: {marketplace_import['ebay_report_path']}. Reselect the file or restore it before scanning."
+                        )
                     ebay_data = parse_ebay_report(
-                        marketplace_import["ebay_report_path"],
+                        str(marketplace_import["ebay_report_path"]),
                         start_date,
                         end_date,
                     )
                     found_keys.update(ebay_mapping_key(column) for column in ebay_data.fee_columns)
                     if any(row.row_type == "Other fee" for row in ebay_data.report_rows):
                         found_keys.add(ebay_standalone_fee_mapping_key())
-                mapping_keys[marketplace_import["account_key"]] = tuple(sorted(found_keys))
+                mapping_keys[str(marketplace_import["account_key"])] = tuple(sorted(found_keys))
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))
             return
@@ -254,7 +300,7 @@ class MappingTab(QWidget):
 
         current_account_mapping = self._account_mapping(mapping, active_import)
         updated_account_mapping = replace(current_account_mapping, **{field_name: selected_guid})
-        self._save_account_mapping(active_import["account_key"], updated_account_mapping)
+        self._save_account_mapping(str(active_import["account_key"]), updated_account_mapping)
 
     def _populate_fee_table(self, keys: list[str], account_mapping: MarketplaceAccountMapping) -> None:
         self.fee_table.setRowCount(len(keys))
@@ -310,7 +356,7 @@ class MappingTab(QWidget):
         updated_fee_accounts = dict(current_account_mapping.fee_accounts)
         updated_fee_accounts[mapping_key] = selected_guid
         updated_account_mapping = replace(current_account_mapping, fee_accounts=updated_fee_accounts)
-        self._save_account_mapping(active_import["account_key"], updated_account_mapping)
+        self._save_account_mapping(str(active_import["account_key"]), updated_account_mapping)
 
     def _save_account_mapping(self, account_key: str, account_mapping: MarketplaceAccountMapping) -> None:
         mapping: MappingConfig = self.app_state.get("mapping_config", MappingConfig())

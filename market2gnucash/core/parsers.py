@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import re
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -14,9 +15,9 @@ from market2gnucash.core.date_utils import parse_date
 from market2gnucash.core.decimal_utils import ZERO, parse_money, parse_money_required
 from market2gnucash.core.models import (
     BankCsvProfile,
-    CsvPreviewData,
     BankStatementData,
     BankStatementRow,
+    CsvPreviewData,
     EbayInputData,
     EbayReportRow,
     EtsyInputData,
@@ -881,15 +882,51 @@ def parse_etsy_sold_orders(
     )
 
 
+def _as_path_tuple(paths: str | Path | Sequence[str | Path]) -> tuple[str | Path, ...]:
+    if isinstance(paths, (str, Path)):
+        return (paths,)
+    return tuple(paths)
+
+
+def parse_etsy_statement_files(
+    paths: str | Path | Sequence[str | Path],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> tuple[EtsyStatementRow, ...]:
+    rows: list[EtsyStatementRow] = []
+    for path in _as_path_tuple(paths):
+        rows.extend(parse_etsy_statement(path, start_date, end_date))
+    return _assign_occurrence_row_ids(
+        rows,
+        prefix="etsy_statement",
+        signature_parts=_etsy_statement_signature,
+    )
+
+
+def parse_etsy_sold_order_files(
+    paths: str | Path | Sequence[str | Path],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> tuple[EtsySoldOrderRow, ...]:
+    rows: list[EtsySoldOrderRow] = []
+    for path in _as_path_tuple(paths):
+        rows.extend(parse_etsy_sold_orders(path, start_date, end_date))
+    return _assign_occurrence_row_ids(
+        rows,
+        prefix="etsy_sold",
+        signature_parts=_etsy_sold_order_signature,
+    )
+
+
 def parse_etsy_inputs(
-    statement_path: str | Path,
-    sold_orders_path: str | Path,
+    statement_path: str | Path | Sequence[str | Path],
+    sold_orders_path: str | Path | Sequence[str | Path],
     start_date: date | None = None,
     end_date: date | None = None,
 ) -> EtsyInputData:
     return EtsyInputData(
-        statement_rows=parse_etsy_statement(statement_path, start_date, end_date),
-        sold_orders=parse_etsy_sold_orders(sold_orders_path, start_date, end_date),
+        statement_rows=parse_etsy_statement_files(statement_path, start_date, end_date),
+        sold_orders=parse_etsy_sold_order_files(sold_orders_path, start_date, end_date),
     )
 
 

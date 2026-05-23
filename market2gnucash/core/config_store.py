@@ -126,7 +126,32 @@ class ConfigStore:
         inputs = state.get("inputs", {})
         if not isinstance(inputs, dict):
             return {}
-        return dict(inputs)
+        migrated = dict(inputs)
+        raw_imports = migrated.get("marketplace_imports", [])
+        if isinstance(raw_imports, list):
+            marketplace_imports: list[Any] = []
+            changed = False
+            for raw_import in raw_imports:
+                if not isinstance(raw_import, dict):
+                    marketplace_imports.append(raw_import)
+                    continue
+                marketplace_import = dict(raw_import)
+                if marketplace_import.get("marketplace") == "etsy" and "etsy_monthly_exports" not in marketplace_import:
+                    statement_path = marketplace_import.get("etsy_statement_path")
+                    sold_orders_path = marketplace_import.get("etsy_sold_orders_path")
+                    if isinstance(statement_path, str) or isinstance(sold_orders_path, str):
+                        marketplace_import["etsy_monthly_exports"] = [
+                            {
+                                "statement_path": statement_path if isinstance(statement_path, str) else None,
+                                "sold_orders_path": sold_orders_path if isinstance(sold_orders_path, str) else None,
+                            }
+                        ]
+                        changed = True
+                marketplace_imports.append(marketplace_import)
+            if changed:
+                migrated["marketplace_imports"] = marketplace_imports
+                self.save_inputs(book_id, migrated)
+        return migrated
 
     def save_inputs(self, book_id: str, inputs: dict[str, Any]) -> None:
         state = self.get_book_state(book_id)

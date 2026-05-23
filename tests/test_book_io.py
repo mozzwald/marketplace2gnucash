@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import gzip
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from market2gnucash.core.book_io import load_book_info
-
 
 _XML_MINIMAL = """<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <gnc-v2>

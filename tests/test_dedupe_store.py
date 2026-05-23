@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import tempfile
+import unittest
 from datetime import date
 from decimal import Decimal
-import tempfile
 from pathlib import Path
-import unittest
 
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import TransferAnchor, TransferAnchorResolution

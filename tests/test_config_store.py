@@ -114,6 +114,30 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertEqual(bank_import["statement_directory"], "/exports/card")
         self.assertEqual(bank_import["csv_profile"]["date_column"], "posted")
 
+    def test_load_inputs_migrates_legacy_ebay_report_path_to_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(path)
+            store.save_inputs(
+                "book-a",
+                {
+                    "marketplace_imports": [
+                        {
+                            "marketplace": "ebay",
+                            "account_key": "ebay:main",
+                            "account_label": "eBay Main",
+                            "ebay_report_path": "/exports/ebay/report.csv",
+                        }
+                    ]
+                },
+            )
+
+            inputs = store.load_inputs("book-a")
+
+        marketplace_import = inputs["marketplace_imports"][0]
+        self.assertEqual(marketplace_import["account_key"], "ebay:main")
+        self.assertEqual(marketplace_import["ebay_report_directory"], "/exports/ebay")
+
     def test_account_scoped_marketplace_mapping_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"

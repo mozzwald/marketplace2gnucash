@@ -147,6 +147,11 @@ class ConfigStore:
                             }
                         ]
                         changed = True
+                if marketplace_import.get("marketplace") == "ebay" and "ebay_report_directory" not in marketplace_import:
+                    report_path = marketplace_import.get("ebay_report_path")
+                    if isinstance(report_path, str) and report_path:
+                        marketplace_import["ebay_report_directory"] = str(Path(report_path).parent)
+                        changed = True
                 marketplace_imports.append(marketplace_import)
             if changed:
                 migrated["marketplace_imports"] = marketplace_imports

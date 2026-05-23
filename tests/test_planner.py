@@ -922,6 +922,133 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(bank_categories), 1)
         self.assertEqual(bank_categories[0].mapping_source, "unmapped")
 
+    def test_build_plan_imports_ebay_reports_from_directory_and_dedupes_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            first_path = tmp_path / "report-a.csv"
+            second_path = tmp_path / "report-b.csv"
+            report_header = "Transaction creation date,Type,Order number,Payout currency,Net amount,Item subtotal,Shipping and handling,Seller collected tax,eBay collected tax,Description,Reference ID,Payout ID,Transaction ID,Legacy order ID,Final Value Fee - fixed"
+            first_path.write_text(
+                "\n".join(
+                    [
+                        "metadata line",
+                        report_header,
+                        '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,REF1,PAY1,TXN1,,0.00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            second_path.write_text(
+                "\n".join(
+                    [
+                        "metadata line",
+                        report_header,
+                        '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,REF1,PAY1,TXN1,,0.00',
+                        '"Apr 14, 2026",Other fee,--,USD,-2.00,0.00,0.00,0.00,0.00,Ad fee,REF2,PAY1,TXN2,,0.00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "ebay:main": MarketplaceAccountMapping(
+                        marketplace="ebay",
+                        account_label="eBay Main",
+                        clearing_guid="guid-asset-ebay",
+                        income_guid="guid-income-ebay",
+                        refunds_guid="guid-refunds-ebay",
+                        fee_accounts={ebay_standalone_fee_mapping_key(): "guid-fees"},
+                    )
+                }
+            )
+
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "ebay-import",
+                        "marketplace": "ebay",
+                        "account_key": "ebay:main",
+                        "account_label": "eBay Main",
+                        "ebay_report_directory": str(tmp_path),
+                    }
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+            first_fees = [row for row in first_plan.transactions if row.transaction.txn_kind == "other_fee"]
+            self.assertEqual(len(first_fees), 3)
+            self.assertEqual(sum(1 for row in first_fees if row.status == "ready"), 3)
+            dedupe_store.mark_imported("book-1", [row.transaction.dedupe_key for row in first_fees])
+
+            third_path = tmp_path / "report-c.csv"
+            third_path.write_text(
+                "\n".join(
+                    [
+                        "metadata line",
+                        report_header,
+                        '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,REF1,PAY1,TXN1,,0.00',
+                        '"Apr 14, 2026",Other fee,--,USD,-2.00,0.00,0.00,0.00,0.00,Ad fee,REF2,PAY1,TXN2,,0.00',
+                        '"Apr 15, 2026",Other fee,--,USD,-3.00,0.00,0.00,0.00,0.00,Ad fee,REF3,PAY1,TXN3,,0.00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "ebay-import",
+                        "marketplace": "ebay",
+                        "account_key": "ebay:main",
+                        "account_label": "eBay Main",
+                        "ebay_report_directory": str(tmp_path),
+                    }
+                ],
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+            second_fees = [row for row in second_plan.transactions if row.transaction.txn_kind == "other_fee"]
+            self.assertEqual(len(second_fees), 6)
+            self.assertEqual(sum(1 for row in second_fees if row.status == "duplicate"), 3)
+            self.assertEqual(sum(1 for row in second_fees if row.status == "ready"), 3)
+
+    def test_build_plan_reports_missing_ebay_report_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "dedupe.sqlite3"
+            missing_dir = Path(tmp_dir) / "missing"
+
+            with self.assertRaisesRegex(ValueError, "references a missing report directory"):
+                build_plan(
+                    book_id="book-1",
+                    dedupe_store=DedupeStore(db_path),
+                    carryover_store=CarryoverStore(db_path),
+                    mapping=MappingConfig(),
+                    marketplace_imports=[
+                        {
+                            "import_id": "ebay-import",
+                            "marketplace": "ebay",
+                            "account_key": "ebay:main",
+                            "account_label": "eBay Main",
+                            "ebay_report_directory": str(missing_dir),
+                        }
+                    ],
+                    bank_imports=[],
+                    start_date=None,
+                    end_date=None,
+                )
+
     def test_build_plan_exposes_ebay_standalone_fee_mapping_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "dedupe.sqlite3"

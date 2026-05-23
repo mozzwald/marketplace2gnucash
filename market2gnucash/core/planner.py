@@ -24,7 +24,7 @@ from market2gnucash.core.models import (
 )
 from market2gnucash.core.parsers import (
     parse_bank_statement_files,
-    parse_ebay_report,
+    parse_ebay_reports,
     parse_etsy_inputs,
 )
 from market2gnucash.core.rules import (
@@ -40,6 +40,7 @@ from market2gnucash.core.rules import (
 _ETSY_STATEMENT_MONTH_RE = re.compile(r"etsy_statement_(\d{4})_(\d{1,2})\.csv$", re.IGNORECASE)
 _ETSY_SOLD_ORDERS_MONTH_RE = re.compile(r"EtsySoldOrders(\d{4})-(\d{1,2})\.csv$", re.IGNORECASE)
 _BANK_STATEMENT_SUFFIXES = {".csv", ".ofx", ".qfx"}
+_EBAY_REPORT_SUFFIXES = {".csv"}
 
 
 def _etsy_month_from_statement_path(path: str | None) -> str | None:
@@ -118,6 +119,16 @@ def _bank_statement_paths_from_directory(directory: str) -> tuple[str, ...]:
         path
         for path in directory_path.iterdir()
         if path.is_file() and path.suffix.lower() in _BANK_STATEMENT_SUFFIXES
+    ]
+    return tuple(str(path) for path in sorted(paths, key=lambda value: (value.name.lower(), str(value))))
+
+
+def _ebay_report_paths_from_directory(directory: str) -> tuple[str, ...]:
+    directory_path = Path(directory)
+    paths = [
+        path
+        for path in directory_path.iterdir()
+        if path.is_file() and path.suffix.lower() in _EBAY_REPORT_SUFFIXES
     ]
     return tuple(str(path) for path in sorted(paths, key=lambda value: (value.name.lower(), str(value))))
 
@@ -275,6 +286,7 @@ def build_plan(
                 etsy_sold_orders_path=raw_import.get("etsy_sold_orders_path") if isinstance(raw_import.get("etsy_sold_orders_path"), str) else None,
                 etsy_monthly_exports=_normalize_etsy_monthly_exports(raw_import),
                 ebay_report_path=raw_import.get("ebay_report_path") if isinstance(raw_import.get("ebay_report_path"), str) else None,
+                ebay_report_directory=raw_import.get("ebay_report_directory") if isinstance(raw_import.get("ebay_report_directory"), str) else None,
             )
         )
 
@@ -316,15 +328,28 @@ def build_plan(
                 f"[{marketplace_import.account_label}] {warning}" for warning in [*input_warnings, *etsy_warnings]
             )
         elif marketplace_import.marketplace == "ebay":
-            if not marketplace_import.ebay_report_path:
-                raise ValueError(f"eBay import '{marketplace_import.account_label}' requires a transaction report CSV")
-            _validate_existing_file(
-                marketplace_import.ebay_report_path,
-                import_label=f"eBay import '{marketplace_import.account_label}'",
-                file_label="transaction report CSV",
-            )
-            ebay_data = parse_ebay_report(
-                marketplace_import.ebay_report_path,
+            if marketplace_import.ebay_report_directory:
+                _validate_existing_directory(
+                    marketplace_import.ebay_report_directory,
+                    import_label=f"eBay import '{marketplace_import.account_label}'",
+                    directory_label="report directory",
+                )
+                ebay_report_paths = _ebay_report_paths_from_directory(marketplace_import.ebay_report_directory)
+                if not ebay_report_paths:
+                    raise ValueError(
+                        f"eBay import '{marketplace_import.account_label}' report directory has no CSV files: {marketplace_import.ebay_report_directory}"
+                    )
+            elif marketplace_import.ebay_report_path:
+                _validate_existing_file(
+                    marketplace_import.ebay_report_path,
+                    import_label=f"eBay import '{marketplace_import.account_label}'",
+                    file_label="transaction report CSV",
+                )
+                ebay_report_paths = (marketplace_import.ebay_report_path,)
+            else:
+                raise ValueError(f"eBay import '{marketplace_import.account_label}' requires a transaction report directory")
+            ebay_data = parse_ebay_reports(
+                ebay_report_paths,
                 start_date=start_date,
                 end_date=end_date,
             )

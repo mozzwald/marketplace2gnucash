@@ -45,7 +45,9 @@ Recommended workflow:
 
 ### eBay
 
-- `eBay Transaction report CSV`
+- A dedicated directory containing one or more eBay Transaction report CSV files
+- Preview imports every CSV file in the selected directory
+- Refreshed/overlapping reports are safe to keep in the directory; duplicate rows are detected by content-based dedupe keys
 
 ### Bank / Card
 

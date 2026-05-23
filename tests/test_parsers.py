@@ -9,6 +9,7 @@ from market2gnucash.core.models import BankCsvProfile
 from market2gnucash.core.parsers import (
     parse_bank_statement_file,
     parse_ebay_report,
+    parse_ebay_reports,
     parse_etsy_inputs,
     parse_etsy_statement,
 )
@@ -46,6 +47,29 @@ class ParserTests(unittest.TestCase):
         order_rows = [row for row in ebay_data.report_rows if row.row_type == "Order"]
         self.assertGreater(len(order_rows), 0)
         self.assertTrue(all(isinstance(row.net_amount, Decimal) for row in order_rows))
+
+    def test_parse_ebay_reports_assigns_occurrences_across_files(self) -> None:
+        report_text = "\n".join(
+            [
+                "metadata line",
+                "Transaction creation date,Type,Order number,Payout currency,Net amount,Item subtotal,Shipping and handling,Seller collected tax,eBay collected tax,Description,Reference ID,Payout ID,Transaction ID,Legacy order ID,Final Value Fee - fixed",
+                '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,REF1,PAY1,TXN1,,0.00',
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_path = Path(tmp_dir) / "report-a.csv"
+            second_path = Path(tmp_dir) / "report-b.csv"
+            first_path.write_text(report_text, encoding="utf-8")
+            second_path.write_text(report_text, encoding="utf-8")
+
+            separate_first = parse_ebay_report(first_path)
+            separate_second = parse_ebay_report(second_path)
+            combined = parse_ebay_reports((first_path, second_path))
+
+        self.assertEqual(separate_first.report_rows[0].row_id, separate_second.report_rows[0].row_id)
+        self.assertEqual(len(combined.report_rows), 2)
+        self.assertEqual(combined.report_rows[0].row_id, separate_first.report_rows[0].row_id)
+        self.assertNotEqual(combined.report_rows[0].row_id, combined.report_rows[1].row_id)
 
     def test_parse_etsy_statement_extracts_listing_ids(self) -> None:
         rows = parse_etsy_statement(RS_SAMPLES / "etsy_statement_2026_2.csv")

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from market2gnucash.core.models import AccountRecord, MappingConfig, MarketplaceAccountMapping
-from market2gnucash.core.parsers import parse_ebay_report, parse_etsy_statement
+from market2gnucash.core.parsers import parse_ebay_reports, parse_etsy_statement
 from market2gnucash.core.rules import (
     ebay_mapping_key,
     ebay_standalone_fee_mapping_key,
@@ -188,9 +188,20 @@ class MappingTab(QWidget):
                         "etsy_statement_path": item.get("etsy_statement_path") if isinstance(item.get("etsy_statement_path"), str) else "",
                         "etsy_monthly_exports": etsy_monthly_exports,
                         "ebay_report_path": item.get("ebay_report_path") if isinstance(item.get("ebay_report_path"), str) else "",
+                        "ebay_report_directory": item.get("ebay_report_directory") if isinstance(item.get("ebay_report_directory"), str) else "",
                     }
                 )
         return normalized
+
+    def _ebay_report_paths_in_directory(self, directory: str) -> tuple[str, ...]:
+        directory_path = Path(directory)
+        if not directory_path.is_dir():
+            return ()
+        return tuple(
+            str(path)
+            for path in sorted(directory_path.iterdir(), key=lambda value: (value.name.lower(), str(value)))
+            if path.is_file() and path.suffix.lower() == ".csv"
+        )
 
     def _selected_account_key(self) -> str | None:
         value = self.account_selector.currentData()
@@ -251,13 +262,30 @@ class MappingTab(QWidget):
                                 found_keys.add(etsy_mapping_key(row))
                                 if row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
                                     found_keys.add("etsy:Fee:Transaction fee:*")
-                if marketplace_import["marketplace"] == "ebay" and marketplace_import["ebay_report_path"]:
-                    if not Path(str(marketplace_import["ebay_report_path"])).is_file():
-                        raise ValueError(
-                            f"eBay import '{marketplace_import['account_label']}' references a missing transaction report CSV: {marketplace_import['ebay_report_path']}. Reselect the file or restore it before scanning."
-                        )
-                    ebay_data = parse_ebay_report(
-                        str(marketplace_import["ebay_report_path"]),
+                if marketplace_import["marketplace"] == "ebay":
+                    report_directory = marketplace_import.get("ebay_report_directory")
+                    if isinstance(report_directory, str) and report_directory:
+                        if not Path(report_directory).is_dir():
+                            raise ValueError(
+                                f"eBay import '{marketplace_import['account_label']}' references a missing report directory: {report_directory}. Reselect the directory or restore it before scanning."
+                            )
+                        report_paths = self._ebay_report_paths_in_directory(report_directory)
+                        if not report_paths:
+                            raise ValueError(
+                                f"eBay import '{marketplace_import['account_label']}' report directory has no CSV files: {report_directory}"
+                            )
+                    elif marketplace_import["ebay_report_path"]:
+                        if not Path(str(marketplace_import["ebay_report_path"])).is_file():
+                            raise ValueError(
+                                f"eBay import '{marketplace_import['account_label']}' references a missing transaction report CSV: {marketplace_import['ebay_report_path']}. Reselect the file or restore it before scanning."
+                            )
+                        report_paths = (str(marketplace_import["ebay_report_path"]),)
+                    else:
+                        report_paths = ()
+                    if not report_paths:
+                        continue
+                    ebay_data = parse_ebay_reports(
+                        report_paths,
                         start_date,
                         end_date,
                     )

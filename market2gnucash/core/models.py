@@ -156,6 +156,7 @@ class MarketplaceImportSpec:
     etsy_sold_orders_path: str | None = None
     etsy_monthly_exports: tuple[EtsyMonthlyExport, ...] = ()
     ebay_report_path: str | None = None
+    ebay_report_directory: str | None = None
 
 
 @dataclass(frozen=True)

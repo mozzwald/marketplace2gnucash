@@ -172,6 +172,7 @@ class InputsTab(QWidget):
                     "etsy_sold_orders_path": item.get("etsy_sold_orders_path") if isinstance(item.get("etsy_sold_orders_path"), str) else None,
                     "etsy_monthly_exports": etsy_monthly_exports,
                     "ebay_report_path": item.get("ebay_report_path") if isinstance(item.get("ebay_report_path"), str) else None,
+                    "ebay_report_directory": item.get("ebay_report_directory") if isinstance(item.get("ebay_report_directory"), str) else None,
                 }
             )
         return normalized
@@ -223,6 +224,7 @@ class InputsTab(QWidget):
                 "etsy_sold_orders_path": None,
                 "etsy_monthly_exports": [],
                 "ebay_report_path": None,
+                "ebay_report_directory": None,
             }
         )
         self._set_marketplace_imports(marketplace_imports)
@@ -244,8 +246,12 @@ class InputsTab(QWidget):
             if marketplace == "etsy":
                 file_parts = self._etsy_file_parts(marketplace_import)
             else:
-                report_path = marketplace_import.get("ebay_report_path")
-                file_parts = [f"Report: {Path(report_path).name}" if report_path else "Report: (none)"]
+                report_directory = marketplace_import.get("ebay_report_directory")
+                if isinstance(report_directory, str) and report_directory:
+                    file_parts = [self._ebay_directory_label(report_directory)]
+                else:
+                    report_path = marketplace_import.get("ebay_report_path")
+                    file_parts = [f"Legacy report: {Path(report_path).name}" if report_path else "Report directory: (none)"]
             self.marketplace_imports_table.setItem(row_index, 2, QTableWidgetItem("\n".join(file_parts)))
 
             actions_widget = QWidget()
@@ -268,9 +274,9 @@ class InputsTab(QWidget):
                 actions_layout.addWidget(detect_button)
                 actions_layout.addWidget(remove_pair_button)
             else:
-                report_button = QPushButton("Report CSV")
+                report_button = QPushButton("Report Directory")
                 report_button.clicked.connect(
-                    lambda _checked=False, idx=row_index: self._select_marketplace_file(idx, "ebay_report_path", "Select eBay Transaction Report CSV")
+                    lambda _checked=False, idx=row_index: self._select_ebay_report_directory(idx)
                 )
                 actions_layout.addWidget(report_button)
 
@@ -320,6 +326,22 @@ class InputsTab(QWidget):
             return f"{sold_match.group(1)}-{int(sold_match.group(2)):02d}"
         return None
 
+    def _ebay_report_paths_in_directory(self, directory: str) -> list[str]:
+        directory_path = Path(directory)
+        if not directory_path.is_dir():
+            return []
+        return [
+            str(path)
+            for path in sorted(directory_path.iterdir(), key=lambda value: (value.name.lower(), str(value)))
+            if path.is_file() and path.suffix.lower() == ".csv"
+        ]
+
+    def _ebay_directory_label(self, directory: str) -> str:
+        if not Path(directory).is_dir():
+            return f"Report directory: {Path(directory).name or directory} (missing)"
+        paths = self._ebay_report_paths_in_directory(directory)
+        return f"Report directory: {Path(directory).name or directory} ({len(paths)} CSV file(s))"
+
     def _rename_marketplace_import(self, row_index: int, account_label: str) -> None:
         marketplace_imports = self._marketplace_imports()
         if row_index >= len(marketplace_imports):
@@ -338,6 +360,17 @@ class InputsTab(QWidget):
         if not file_path:
             return
         marketplace_imports[row_index][field_name] = file_path
+        self._set_marketplace_imports(marketplace_imports)
+
+    def _select_ebay_report_directory(self, row_index: int) -> None:
+        marketplace_imports = self._marketplace_imports()
+        if row_index >= len(marketplace_imports):
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Select eBay Report Directory", "")
+        if not directory:
+            return
+        marketplace_imports[row_index]["ebay_report_directory"] = directory
+        marketplace_imports[row_index]["ebay_report_path"] = None
         self._set_marketplace_imports(marketplace_imports)
 
     def _add_etsy_monthly_pair(self, row_index: int) -> None:
@@ -441,6 +474,7 @@ class InputsTab(QWidget):
             marketplace_imports[row_index]["etsy_monthly_exports"] = []
         else:
             marketplace_imports[row_index]["ebay_report_path"] = None
+            marketplace_imports[row_index]["ebay_report_directory"] = None
         self._set_marketplace_imports(marketplace_imports)
 
     def _remove_marketplace_import(self, row_index: int) -> None:

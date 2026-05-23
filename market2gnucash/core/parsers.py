@@ -1003,3 +1003,24 @@ def parse_ebay_report(
         ),
         fee_columns=fee_columns,
     )
+
+
+def parse_ebay_reports(
+    paths: str | Path | Sequence[str | Path],
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> EbayInputData:
+    rows: list[EbayReportRow] = []
+    fee_columns: set[str] = set()
+    for path in _as_path_tuple(paths):
+        report = parse_ebay_report(path, start_date, end_date)
+        rows.extend(report.report_rows)
+        fee_columns.update(report.fee_columns)
+    return EbayInputData(
+        report_rows=_assign_occurrence_row_ids(
+            rows,
+            prefix="ebay_report",
+            signature_parts=_ebay_report_signature,
+        ),
+        fee_columns=tuple(sorted(fee_columns)),
+    )

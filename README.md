@@ -24,7 +24,7 @@ Cross-platform Python 3.11+ desktop GUI (PySide6) to import Etsy/eBay marketplac
   - Inputs + mapping configuration persisted per `book_id`
 - Bank/card import support:
   - CSV and OFX/QFX statements
-  - Multiple statement files per account import bundle
+  - One statement directory per account import bundle
   - CSV profile/mapping support for headerless or nonstandard CSV layouts
 - Decimal-only monetary handling (no float arithmetic)
 
@@ -50,11 +50,12 @@ Recommended workflow:
 ### Bank / Card
 
 - One import bundle per bank or card account
-- Attach one or more statement files per bundle
+- Select a dedicated statement directory per account; preview imports every supported statement file in that directory
 - Supported formats:
   - CSV
   - OFX / QFX
-- Nonstandard or headerless CSV layouts can be configured through the app's CSV mapping dialog
+- Nonstandard or headerless CSV layouts can be configured once per bank/card bundle through the app's CSV mapping dialog
+- Renaming files inside the selected directory does not require reselecting them; moved directories must be reselected
 
 ## Accounting Rules Implemented
 

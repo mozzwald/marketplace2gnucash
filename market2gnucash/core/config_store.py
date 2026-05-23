@@ -151,6 +151,42 @@ class ConfigStore:
             if changed:
                 migrated["marketplace_imports"] = marketplace_imports
                 self.save_inputs(book_id, migrated)
+        raw_bank_imports = migrated.get("bank_imports", [])
+        if isinstance(raw_bank_imports, list):
+            bank_imports: list[Any] = []
+            changed = False
+            for raw_import in raw_bank_imports:
+                if not isinstance(raw_import, dict):
+                    bank_imports.append(raw_import)
+                    continue
+                bank_import = dict(raw_import)
+                if "statement_directory" not in bank_import:
+                    raw_statement_paths = bank_import.get("statement_paths", [])
+                    statement_paths = [
+                        Path(path)
+                        for path in raw_statement_paths
+                        if isinstance(path, str) and path
+                    ] if isinstance(raw_statement_paths, list) else []
+                    parent_dirs = {str(path.parent) for path in statement_paths}
+                    if len(parent_dirs) == 1:
+                        bank_import["statement_directory"] = next(iter(parent_dirs))
+                        raw_profiles = bank_import.get("csv_profiles", {})
+                        if "csv_profile" not in bank_import and isinstance(raw_profiles, dict):
+                            first_profile = next(
+                                (
+                                    profile
+                                    for profile in raw_profiles.values()
+                                    if isinstance(profile, dict)
+                                ),
+                                None,
+                            )
+                            if first_profile is not None:
+                                bank_import["csv_profile"] = dict(first_profile)
+                        changed = True
+                bank_imports.append(bank_import)
+            if changed:
+                migrated["bank_imports"] = bank_imports
+                self.save_inputs(book_id, migrated)
         return migrated
 
     def save_inputs(self, book_id: str, inputs: dict[str, Any]) -> None:

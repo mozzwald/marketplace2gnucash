@@ -202,7 +202,6 @@ def _bank_statement_signature(row: BankStatementRow) -> list[str]:
         row.check_number or "",
         row.transaction_type or "",
         row.account_id or "",
-        row.account_name or "",
     ]
 
 

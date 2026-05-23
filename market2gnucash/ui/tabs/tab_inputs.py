@@ -108,12 +108,12 @@ class InputsTab(QWidget):
 
         self.bank_imports_table = QTableWidget()
         self.bank_imports_table.setColumnCount(3)
-        self.bank_imports_table.setHorizontalHeaderLabels(["Account", "Statement Files", "Actions"])
+        self.bank_imports_table.setHorizontalHeaderLabels(["Account", "Statement Directory", "Actions"])
         self.bank_imports_table.verticalHeader().setVisible(False)
         bank_layout.addWidget(self.bank_imports_table)
 
         self.bank_hint_label = QLabel(
-            "Create one import bundle per bank/card account, then attach one or more CSV or OFX/QFX statement files. Use CSV Mapping for headerless or nonstandard CSV layouts."
+            "Create one import bundle per bank/card account, then select a directory containing CSV or OFX/QFX statement files. Use CSV Mapping for headerless or nonstandard CSV layouts."
         )
         bank_layout.addWidget(self.bank_hint_label)
         layout.addWidget(bank_group)
@@ -460,11 +460,13 @@ class InputsTab(QWidget):
             normalized.append(
                 {
                     "account_guid": item.get("account_guid") if isinstance(item.get("account_guid"), str) else None,
+                    "statement_directory": item.get("statement_directory") if isinstance(item.get("statement_directory"), str) else None,
                     "statement_paths": [
                         path
                         for path in item.get("statement_paths", [])
                         if isinstance(path, str) and path
                     ],
+                    "csv_profile": dict(item.get("csv_profile")) if isinstance(item.get("csv_profile"), dict) else None,
                     "csv_profiles": {
                         path: dict(profile)
                         for path, profile in item.get("csv_profiles", {}).items()
@@ -491,18 +493,13 @@ class InputsTab(QWidget):
             account_label = account.full_name if account else "(select account)"
             self.bank_imports_table.setItem(row_index, 0, QTableWidgetItem(account_label))
 
-            statement_paths = [
-                str(path) for path in bank_import.get("statement_paths", []) if isinstance(path, str)
-            ]
-            csv_profiles = bank_import.get("csv_profiles", {})
-            if statement_paths:
-                labels = []
-                for path in statement_paths:
-                    suffix = " [mapped]" if isinstance(csv_profiles, dict) and path in csv_profiles else ""
-                    labels.append(f"{Path(path).name}{suffix}")
-                files_label = "\n".join(labels)
+            statement_directory = bank_import.get("statement_directory")
+            if isinstance(statement_directory, str) and statement_directory:
+                files_label = self._bank_directory_label(statement_directory, bank_import)
+            elif bank_import.get("statement_paths"):
+                files_label = "(legacy file selection)"
             else:
-                files_label = "(no files selected)"
+                files_label = "(no directory selected)"
             self.bank_imports_table.setItem(row_index, 1, QTableWidgetItem(files_label))
 
             actions_widget = QWidget()
@@ -513,17 +510,17 @@ class InputsTab(QWidget):
             select_account_button.clicked.connect(
                 lambda _checked=False, idx=row_index: self._select_bank_import_account(idx)
             )
-            add_files_button = QPushButton("Add Files")
-            add_files_button.clicked.connect(
-                lambda _checked=False, idx=row_index: self._add_files_to_bank_import(idx)
+            select_directory_button = QPushButton("Select Directory")
+            select_directory_button.clicked.connect(
+                lambda _checked=False, idx=row_index: self._select_bank_import_directory(idx)
             )
             csv_profile_button = QPushButton("CSV Mapping")
             csv_profile_button.clicked.connect(
                 lambda _checked=False, idx=row_index: self._configure_csv_profiles(idx)
             )
-            clear_files_button = QPushButton("Clear Files")
+            clear_files_button = QPushButton("Clear Directory")
             clear_files_button.clicked.connect(
-                lambda _checked=False, idx=row_index: self._clear_files_for_bank_import(idx)
+                lambda _checked=False, idx=row_index: self._clear_directory_for_bank_import(idx)
             )
             remove_button = QPushButton("Remove")
             remove_button.clicked.connect(
@@ -531,7 +528,7 @@ class InputsTab(QWidget):
             )
 
             actions_layout.addWidget(select_account_button)
-            actions_layout.addWidget(add_files_button)
+            actions_layout.addWidget(select_directory_button)
             actions_layout.addWidget(csv_profile_button)
             actions_layout.addWidget(clear_files_button)
             actions_layout.addWidget(remove_button)
@@ -542,8 +539,26 @@ class InputsTab(QWidget):
 
     def _add_bank_import(self) -> None:
         bank_imports = self._bank_imports()
-        bank_imports.append({"account_guid": None, "statement_paths": [], "csv_profiles": {}})
+        bank_imports.append({"account_guid": None, "statement_directory": None, "csv_profile": None})
         self._set_bank_imports(bank_imports)
+
+    def _bank_statement_paths_in_directory(self, directory: str) -> list[str]:
+        directory_path = Path(directory)
+        if not directory_path.is_dir():
+            return []
+        supported = {".csv", ".ofx", ".qfx"}
+        return [
+            str(path)
+            for path in sorted(directory_path.iterdir(), key=lambda value: (value.name.lower(), str(value)))
+            if path.is_file() and path.suffix.lower() in supported
+        ]
+
+    def _bank_directory_label(self, directory: str, bank_import: dict[str, object]) -> str:
+        suffix = " [mapped]" if isinstance(bank_import.get("csv_profile"), dict) else ""
+        if not Path(directory).is_dir():
+            return f"{Path(directory).name or directory}: missing directory{suffix}"
+        paths = self._bank_statement_paths_in_directory(directory)
+        return f"{Path(directory).name or directory}: {len(paths)} statement file(s){suffix}"
 
     def _select_bank_import_account(self, row_index: int) -> None:
         accounts: tuple[AccountRecord, ...] = self.app_state.get("accounts", ())
@@ -572,30 +587,22 @@ class InputsTab(QWidget):
         bank_imports[row_index]["account_guid"] = selected_guid
         self._set_bank_imports(bank_imports)
 
-    def _add_files_to_bank_import(self, row_index: int) -> None:
+    def _select_bank_import_directory(self, row_index: int) -> None:
         bank_imports = self._bank_imports()
         if row_index >= len(bank_imports):
             return
 
-        file_paths, _ = QFileDialog.getOpenFileNames(
+        directory = QFileDialog.getExistingDirectory(
             self,
-            "Select Bank/Card Statement Files",
+            "Select Bank/Card Statement Directory",
             "",
-            "Statement Files (*.csv *.ofx *.qfx);;CSV Files (*.csv);;OFX Files (*.ofx *.qfx);;All Files (*)",
         )
-        if not file_paths:
+        if not directory:
             return
 
-        existing = list(bank_imports[row_index].get("statement_paths", []))
-        for path in file_paths:
-            if path not in existing:
-                existing.append(path)
-        bank_imports[row_index]["statement_paths"] = existing
-        profiles = bank_imports[row_index].get("csv_profiles", {})
-        if isinstance(profiles, dict):
-            bank_imports[row_index]["csv_profiles"] = {
-                path: profile for path, profile in profiles.items() if path in existing
-            }
+        bank_imports[row_index]["statement_directory"] = directory
+        bank_imports[row_index]["statement_paths"] = []
+        bank_imports[row_index]["csv_profiles"] = {}
         self._set_bank_imports(bank_imports)
 
     def _configure_csv_profiles(self, row_index: int) -> None:
@@ -603,39 +610,59 @@ class InputsTab(QWidget):
         if row_index >= len(bank_imports):
             return
 
+        statement_directory = bank_imports[row_index].get("statement_directory")
+        if not isinstance(statement_directory, str) or not statement_directory:
+            QMessageBox.information(
+                self,
+                "No Directory",
+                "Select a statement directory for this account import bundle first.",
+            )
+            return
+
         statement_paths = [
             path
-            for path in bank_imports[row_index].get("statement_paths", [])
-            if isinstance(path, str) and path.lower().endswith(".csv")
+            for path in self._bank_statement_paths_in_directory(statement_directory)
+            if path.lower().endswith(".csv")
         ]
         if not statement_paths:
             QMessageBox.information(
                 self,
                 "No CSV Files",
-                "Attach one or more CSV files to this account import bundle first.",
+                "The selected statement directory does not contain any CSV files.",
             )
             return
 
-        csv_profiles = bank_imports[row_index].get("csv_profiles", {})
+        csv_profile = bank_imports[row_index].get("csv_profile")
+        existing_profiles = {
+            path: csv_profile
+            for path in statement_paths
+            if isinstance(csv_profile, dict)
+        }
         dialog = CsvProfileDialog(
             statement_paths,
-            csv_profiles if isinstance(csv_profiles, dict) else {},
+            existing_profiles,
             parent=self,
         )
         if dialog.exec() != QDialog.Accepted:
             return
 
-        bank_imports[row_index]["csv_profiles"] = {
-            path: bank_csv_profile_to_dict(profile)
-            for path, profile in dialog.profiles().items()
-        }
+        profiles = dialog.profiles()
+        first_profile = profiles.get(statement_paths[0])
+        if first_profile is None and profiles:
+            first_profile = next(iter(profiles.values()))
+        bank_imports[row_index]["csv_profile"] = (
+            bank_csv_profile_to_dict(first_profile) if first_profile is not None else None
+        )
+        bank_imports[row_index]["csv_profiles"] = {}
         self._set_bank_imports(bank_imports)
 
-    def _clear_files_for_bank_import(self, row_index: int) -> None:
+    def _clear_directory_for_bank_import(self, row_index: int) -> None:
         bank_imports = self._bank_imports()
         if row_index >= len(bank_imports):
             return
+        bank_imports[row_index]["statement_directory"] = None
         bank_imports[row_index]["statement_paths"] = []
+        bank_imports[row_index]["csv_profile"] = None
         bank_imports[row_index]["csv_profiles"] = {}
         self._set_bank_imports(bank_imports)
 

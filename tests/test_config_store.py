@@ -82,6 +82,38 @@ class ConfigStoreTests(unittest.TestCase):
             ],
         )
 
+    def test_load_inputs_migrates_legacy_bank_paths_to_statement_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(path)
+            store.save_inputs(
+                "book-a",
+                {
+                    "bank_imports": [
+                        {
+                            "account_guid": "guid-card",
+                            "statement_paths": [
+                                "/exports/card/january.csv",
+                                "/exports/card/february.csv",
+                            ],
+                            "csv_profiles": {
+                                "/exports/card/january.csv": {
+                                    "has_header": True,
+                                    "date_column": "posted",
+                                }
+                            },
+                        }
+                    ]
+                },
+            )
+
+            inputs = store.load_inputs("book-a")
+
+        bank_import = inputs["bank_imports"][0]
+        self.assertEqual(bank_import["account_guid"], "guid-card")
+        self.assertEqual(bank_import["statement_directory"], "/exports/card")
+        self.assertEqual(bank_import["csv_profile"]["date_column"], "posted")
+
     def test_account_scoped_marketplace_mapping_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"

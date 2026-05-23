@@ -134,7 +134,9 @@ class BankCsvProfile:
 @dataclass(frozen=True)
 class BankImportSpec:
     account_guid: str | None
-    statement_paths: tuple[str, ...]
+    statement_directory: str | None = None
+    statement_paths: tuple[str, ...] = ()
+    csv_profile: BankCsvProfile | None = None
     csv_profiles: Mapping[str, BankCsvProfile] = field(default_factory=dict)
 
 

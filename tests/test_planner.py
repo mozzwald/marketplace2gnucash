@@ -576,6 +576,161 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(sum(1 for row in second_bank_rows if row.status == "duplicate"), 3)
             self.assertEqual(sum(1 for row in second_bank_rows if row.status == "ready"), 2)
 
+    def test_build_plan_imports_bank_card_statements_from_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            first_path = tmp_path / "first.csv"
+            second_path = tmp_path / "second.csv"
+            ignored_path = tmp_path / "notes.txt"
+            first_path.write_text(
+                "\n".join(["Date,Description,Amount,Reference", "04/13/2026,COFFEE,-4.25,A1"]),
+                encoding="utf-8",
+            )
+            second_path.write_text(
+                "\n".join(["Date,Description,Amount,Reference", "04/14/2026,LUNCH,-12.00,A2"]),
+                encoding="utf-8",
+            )
+            ignored_path.write_text("not a statement", encoding="utf-8")
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=CarryoverStore(db_path),
+                mapping=MappingConfig(
+                    bank_merchant_accounts={
+                        bank_merchant_key("COFFEE"): "guid-exp-food",
+                        bank_merchant_key("LUNCH"): "guid-exp-food",
+                    }
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_directory": str(tmp_path)}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+
+        bank_rows = [row for row in plan.transactions if row.transaction.marketplace == "bank"]
+        self.assertEqual({row.transaction.external_ref for row in bank_rows}, {"A1", "A2"})
+        self.assertTrue(all(row.status == "ready" for row in bank_rows))
+
+    def test_bank_directory_import_dedupes_no_fitid_csv_after_filename_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            old_path = tmp_path / "card-old-name.csv"
+            new_path = tmp_path / "card-new-name.csv"
+            csv_text = "\n".join(["Date,Description,Amount", "04/13/2026,VISA PURCHASE,-1.00"])
+            old_path.write_text(csv_text, encoding="utf-8")
+
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VISA PURCHASE"): "guid-exp-card"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_directory": str(tmp_path)}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+            first_bank_rows = [row for row in first_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(first_bank_rows), 1)
+            self.assertEqual(first_bank_rows[0].status, "ready")
+            first_key = first_bank_rows[0].transaction.dedupe_key
+            dedupe_store.mark_imported("book-1", [first_key])
+
+            old_path.rename(new_path)
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VISA PURCHASE"): "guid-exp-card"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_directory": str(tmp_path)}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+            second_bank_rows = [row for row in second_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(second_bank_rows), 1)
+            self.assertEqual(second_bank_rows[0].transaction.dedupe_key, first_key)
+            self.assertEqual(second_bank_rows[0].status, "duplicate")
+
+    def test_bank_directory_csv_profile_is_not_keyed_by_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            carryover_store = CarryoverStore(db_path)
+            old_path = tmp_path / "custom-old.csv"
+            new_path = tmp_path / "custom-new.csv"
+            csv_text = "\n".join(["Posted,Payee,Outflow", "04/13/2026,VENDOR,7.50"])
+            csv_profile = {
+                "has_header": True,
+                "date_column": "posted",
+                "debit_column": "outflow",
+                "description_column": "payee",
+            }
+            old_path.write_text(csv_text, encoding="utf-8")
+
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VENDOR"): "guid-exp-vendor"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {
+                        "account_guid": "guid-card",
+                        "statement_directory": str(tmp_path),
+                        "csv_profile": csv_profile,
+                    }
+                ],
+                start_date=None,
+                end_date=None,
+            )
+            first_bank_rows = [row for row in first_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(first_bank_rows), 1)
+            self.assertEqual(first_bank_rows[0].transaction.clearing_amount, Decimal("-7.50"))
+            first_key = first_bank_rows[0].transaction.dedupe_key
+            dedupe_store.mark_imported("book-1", [first_key])
+
+            old_path.rename(new_path)
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VENDOR"): "guid-exp-vendor"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {
+                        "account_guid": "guid-card",
+                        "statement_directory": str(tmp_path),
+                        "csv_profile": csv_profile,
+                    }
+                ],
+                start_date=None,
+                end_date=None,
+            )
+            second_bank_rows = [row for row in second_plan.transactions if row.transaction.marketplace == "bank"]
+            self.assertEqual(len(second_bank_rows), 1)
+            self.assertEqual(second_bank_rows[0].transaction.dedupe_key, first_key)
+            self.assertEqual(second_bank_rows[0].status, "duplicate")
+
     def test_build_plan_exposes_balance_sheet_transfer_anchor_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "dedupe.sqlite3"

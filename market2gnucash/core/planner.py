@@ -39,6 +39,7 @@ from market2gnucash.core.rules import (
 
 _ETSY_STATEMENT_MONTH_RE = re.compile(r"etsy_statement_(\d{4})_(\d{1,2})\.csv$", re.IGNORECASE)
 _ETSY_SOLD_ORDERS_MONTH_RE = re.compile(r"EtsySoldOrders(\d{4})-(\d{1,2})\.csv$", re.IGNORECASE)
+_BANK_STATEMENT_SUFFIXES = {".csv", ".ofx", ".qfx"}
 
 
 def _etsy_month_from_statement_path(path: str | None) -> str | None:
@@ -94,6 +95,31 @@ def _validate_existing_file(path: str, *, import_label: str, file_label: str) ->
         raise ValueError(
             f"{import_label} references a missing {file_label}: {path}. Reselect the file or restore it before previewing."
         )
+
+
+def _validate_existing_directory(path: str, *, import_label: str, directory_label: str) -> None:
+    if not Path(path).is_dir():
+        raise ValueError(
+            f"{import_label} references a missing {directory_label}: {path}. Reselect the directory or restore it before previewing."
+        )
+
+
+def _bank_csv_profile_from_raw(raw_profile: object) -> BankCsvProfile | dict[str, object] | None:
+    if isinstance(raw_profile, BankCsvProfile):
+        return raw_profile
+    if isinstance(raw_profile, dict):
+        return raw_profile
+    return None
+
+
+def _bank_statement_paths_from_directory(directory: str) -> tuple[str, ...]:
+    directory_path = Path(directory)
+    paths = [
+        path
+        for path in directory_path.iterdir()
+        if path.is_file() and path.suffix.lower() in _BANK_STATEMENT_SUFFIXES
+    ]
+    return tuple(str(path) for path in sorted(paths, key=lambda value: (value.name.lower(), str(value))))
 
 
 def _validate_etsy_exports(marketplace_import: MarketplaceImportSpec) -> tuple[tuple[str, ...], tuple[str, ...], list[str]]:
@@ -360,16 +386,41 @@ def build_plan(
         bank_row_count = 0
         for raw_import in bank_imports:
             account_guid = raw_import.get("account_guid")
-            statement_paths = tuple(
-                path for path in raw_import.get("statement_paths", []) if isinstance(path, str) and path
+            statement_directory = raw_import.get("statement_directory")
+            statement_directory = (
+                statement_directory
+                if isinstance(statement_directory, str) and statement_directory
+                else None
             )
             csv_profiles: dict[str, BankCsvProfile | dict[str, object]] = {}
+            bundle_csv_profile = _bank_csv_profile_from_raw(raw_import.get("csv_profile"))
             raw_profiles = raw_import.get("csv_profiles", {})
-            if isinstance(raw_profiles, dict):
-                for path, profile in raw_profiles.items():
-                    if isinstance(path, str):
-                        csv_profiles[path] = profile
-            if not statement_paths and not account_guid:
+            if statement_directory:
+                _validate_existing_directory(
+                    statement_directory,
+                    import_label=f"Bank/Card import bundle for account {account_guid or '(unselected)'}",
+                    directory_label="statement directory",
+                )
+                statement_paths = _bank_statement_paths_from_directory(statement_directory)
+                if bundle_csv_profile is not None:
+                    csv_profiles = {
+                        path: bundle_csv_profile
+                        for path in statement_paths
+                        if Path(path).suffix.lower() == ".csv"
+                    }
+                elif isinstance(raw_profiles, dict):
+                    for path, profile in raw_profiles.items():
+                        if isinstance(path, str):
+                            csv_profiles[path] = profile
+            else:
+                statement_paths = tuple(
+                    path for path in raw_import.get("statement_paths", []) if isinstance(path, str) and path
+                )
+                if isinstance(raw_profiles, dict):
+                    for path, profile in raw_profiles.items():
+                        if isinstance(path, str):
+                            csv_profiles[path] = profile
+            if not statement_paths and not account_guid and not statement_directory:
                 continue
             if not statement_paths:
                 all_warnings.append(
@@ -383,7 +434,9 @@ def build_plan(
                 )
             spec = BankImportSpec(
                 account_guid=account_guid if isinstance(account_guid, str) else None,
+                statement_directory=statement_directory,
                 statement_paths=statement_paths,
+                csv_profile=bundle_csv_profile if isinstance(bundle_csv_profile, BankCsvProfile) else None,
                 csv_profiles=csv_profiles,
             )
             statements = parse_bank_statement_files(

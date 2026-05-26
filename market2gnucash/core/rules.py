@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
@@ -131,6 +132,7 @@ def _finalize_transaction(
     splits: list[PlannedSplit],
     source_row_ids: list[str],
     warnings: list[str],
+    dedupe_aliases: tuple[str, ...] = (),
 ) -> PlannedTransaction:
     split_total = _split_sum(splits)
     if split_total != ZERO:
@@ -148,6 +150,7 @@ def _finalize_transaction(
         clearing_amount=clearing_amount,
         splits=tuple(splits),
         source_row_ids=tuple(source_row_ids),
+        dedupe_aliases=dedupe_aliases,
         warnings=tuple(warnings),
     )
 
@@ -1068,6 +1071,7 @@ def build_ebay_charge_match_candidates(
 @dataclass(frozen=True)
 class _BankRowCandidate:
     dedupe_key: str
+    legacy_dedupe_keys: tuple[str, ...]
     txn_id: str
     row_id: str
     date: date
@@ -1076,6 +1080,17 @@ class _BankRowCandidate:
     bank_label: str
     account_guid: str | None
     external_ref: str
+
+
+def _bank_candidate_keys(row: _BankRowCandidate) -> tuple[str, ...]:
+    return (row.dedupe_key, *row.legacy_dedupe_keys)
+
+
+def _first_bank_mapping_value(mapping: Mapping[str, object], row: _BankRowCandidate) -> object | None:
+    for key in _bank_candidate_keys(row):
+        if key in mapping:
+            return mapping[key]
+    return None
 
 
 def build_bank_transactions(
@@ -1122,9 +1137,15 @@ def build_bank_transactions(
                 bank_label = statement.account_id or statement.account_name or Path(statement.source_path).name
                 description = _first_nonempty(row.description, row.memo, f"Bank/Card entry {txn_id}") or f"Bank/Card entry {txn_id}"
                 dedupe_key = f"bank:{import_key}:{txn_id}"
+                legacy_dedupe_keys = tuple(
+                    f"bank:{import_key}:{legacy_row_id}"
+                    for legacy_row_id in row.legacy_row_ids
+                    if legacy_row_id != txn_id
+                )
                 bank_rows.append(
                     _BankRowCandidate(
                         dedupe_key=dedupe_key,
+                        legacy_dedupe_keys=legacy_dedupe_keys,
                         txn_id=txn_id,
                         row_id=row.row_id,
                         date=row.date,
@@ -1147,7 +1168,7 @@ def build_bank_transactions(
             bank_description=row.description,
             bank_dedupe_key=row.dedupe_key,
             bank_txn_id=row.txn_id,
-            override_ids=mapping.bank_match_overrides.get(row.dedupe_key, ()),
+            override_ids=_first_bank_mapping_value(mapping.bank_match_overrides, row) or (),
         )
         match_results.append(match_result)
         match_by_key[row.dedupe_key] = match_result
@@ -1232,7 +1253,8 @@ def build_bank_transactions(
                     txn_warnings.append(
                         f"TRANSFER_OVERRIDE_INVALID: Manual bank/card transfer override is invalid for row {row.txn_id}"
                     )
-                txn_override_guid = mapping.bank_txn_account_overrides.get(row.dedupe_key)
+                txn_override_guid = _first_bank_mapping_value(mapping.bank_txn_account_overrides, row)
+                txn_override_guid = txn_override_guid if isinstance(txn_override_guid, str) else None
                 merchant_account_guid = mapping.bank_merchant_accounts.get(merchant_key)
                 counterparty_guid = txn_override_guid or merchant_account_guid
                 if match_result.status == "unmatched" and transfer_result.status == "unmatched" and counterparty_guid:
@@ -1303,6 +1325,7 @@ def build_bank_transactions(
                 splits=splits,
                 source_row_ids=[row.row_id],
                 warnings=txn_warnings,
+                dedupe_aliases=row.legacy_dedupe_keys,
             )
         )
 
@@ -1341,7 +1364,11 @@ def _build_transfer_results(
         )
         for row in bank_rows
     }
-    by_key = {row.dedupe_key: row for row in bank_rows}
+    by_key = {
+        key: row
+        for row in bank_rows
+        for key in _bank_candidate_keys(row)
+    }
     assigned: set[str] = set()
     ambiguous: set[str] = set()
 
@@ -1393,8 +1420,8 @@ def _build_transfer_results(
             counterpart_account_guid=canonical.account_guid,
             counterpart_account_label=canonical.bank_label,
         )
-        assigned.add(canonical.dedupe_key)
-        assigned.add(counterpart.dedupe_key)
+        assigned.update(_bank_candidate_keys(canonical))
+        assigned.update(_bank_candidate_keys(counterpart))
 
     for left_key, right_key in mapping.bank_transfer_overrides.items():
         if left_key in assigned:

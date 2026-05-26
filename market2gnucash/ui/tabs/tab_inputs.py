@@ -634,8 +634,11 @@ class InputsTab(QWidget):
         if not directory:
             return
 
+        previous_directory = bank_imports[row_index].get("statement_directory")
         bank_imports[row_index]["statement_directory"] = directory
         bank_imports[row_index]["statement_paths"] = []
+        if previous_directory != directory:
+            bank_imports[row_index]["csv_profile"] = None
         bank_imports[row_index]["csv_profiles"] = {}
         self._set_bank_imports(bank_imports)
 

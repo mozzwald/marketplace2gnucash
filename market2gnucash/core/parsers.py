@@ -205,6 +205,30 @@ def _bank_statement_signature(row: BankStatementRow) -> list[str]:
     ]
 
 
+def _legacy_filename_bank_statement_signature(row: BankStatementRow) -> list[str]:
+    return [*_bank_statement_signature(row), row.account_name or ""]
+
+
+def _assign_bank_statement_row_ids(rows: list[BankStatementRow], *, prefix: str) -> tuple[BankStatementRow, ...]:
+    occurrence_by_signature: dict[tuple[str, ...], int] = {}
+    legacy_occurrence_by_signature: dict[tuple[str, ...], int] = {}
+    updated_rows: list[BankStatementRow] = []
+    for row in rows:
+        signature = tuple(_bank_statement_signature(row))
+        occurrence = occurrence_by_signature.get(signature, 0) + 1
+        occurrence_by_signature[signature] = occurrence
+        row_id = _stable_row_id(prefix, list(signature), occurrence)
+
+        legacy_signature = tuple(_legacy_filename_bank_statement_signature(row))
+        legacy_occurrence = legacy_occurrence_by_signature.get(legacy_signature, 0) + 1
+        legacy_occurrence_by_signature[legacy_signature] = legacy_occurrence
+        legacy_row_id = _stable_row_id(prefix, list(legacy_signature), legacy_occurrence)
+        legacy_row_ids = (legacy_row_id,) if legacy_row_id != row_id else ()
+
+        updated_rows.append(replace(row, row_id=row_id, legacy_row_ids=legacy_row_ids))
+    return tuple(updated_rows)
+
+
 def _within_date_range(row_date: date, start_date: date | None, end_date: date | None) -> bool:
     if start_date and row_date < start_date:
         return False
@@ -501,11 +525,7 @@ def _parse_profiled_bank_csv(
         account_id=account_id,
         account_name=account_name or path.stem,
         currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
-        rows=_assign_occurrence_row_ids(
-            rows,
-            prefix="bank_csv_profile",
-            signature_parts=_bank_statement_signature,
-        ),
+        rows=_assign_bank_statement_row_ids(rows, prefix="bank_csv_profile"),
     )
 
 
@@ -610,11 +630,7 @@ def _parse_bank_csv(
         account_id=account_id,
         account_name=account_name or path.stem,
         currency=next(iter(currency_values)) if len(currency_values) == 1 else None,
-        rows=_assign_occurrence_row_ids(
-            rows,
-            prefix="bank_csv",
-            signature_parts=_bank_statement_signature,
-        ),
+        rows=_assign_bank_statement_row_ids(rows, prefix="bank_csv"),
     )
 
 
@@ -761,11 +777,7 @@ def _parse_bank_ofx(
         account_id=account_id,
         account_name=account_name,
         currency=currency,
-        rows=_assign_occurrence_row_ids(
-            rows,
-            prefix="bank_ofx",
-            signature_parts=_bank_statement_signature,
-        ),
+        rows=_assign_bank_statement_row_ids(rows, prefix="bank_ofx"),
     )
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from market2gnucash.core.carryover_store import CarryoverStore
 from market2gnucash.core.dedupe_store import DedupeStore
 from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping, TransferAnchor
+from market2gnucash.core.parsers import parse_bank_statement_file
 from market2gnucash.core.planner import build_plan
 from market2gnucash.core.rules import bank_merchant_key, ebay_standalone_fee_mapping_key
 
@@ -730,6 +731,80 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(len(second_bank_rows), 1)
             self.assertEqual(second_bank_rows[0].transaction.dedupe_key, first_key)
             self.assertEqual(second_bank_rows[0].status, "duplicate")
+
+    def test_bank_directory_honors_legacy_filename_based_transaction_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            statement_path = tmp_path / "card-old-name.csv"
+            statement_path.write_text(
+                "\n".join(["Date,Description,Amount", "04/13/2026,VISA PURCHASE,-1.00"]),
+                encoding="utf-8",
+            )
+            parsed = parse_bank_statement_file(statement_path)
+            legacy_row_id = parsed.rows[0].legacy_row_ids[0]
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=CarryoverStore(db_path),
+                mapping=MappingConfig(
+                    bank_txn_account_overrides={
+                        f"bank:guid-card:{legacy_row_id}": "guid-exp-legacy"
+                    }
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_directory": str(tmp_path)}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+
+        bank_rows = [row for row in plan.transactions if row.transaction.marketplace == "bank"]
+        self.assertEqual(len(bank_rows), 1)
+        self.assertEqual(bank_rows[0].status, "ready")
+        self.assertIn(f"bank:guid-card:{legacy_row_id}", bank_rows[0].transaction.dedupe_aliases)
+        self.assertTrue(
+            any(
+                split.account_guid == "guid-exp-legacy"
+                and split.mapping_key == "bank:txn-override"
+                for split in bank_rows[0].transaction.splits
+            )
+        )
+
+    def test_bank_directory_honors_legacy_filename_based_dedupe_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            dedupe_store = DedupeStore(db_path)
+            statement_path = tmp_path / "card-old-name.csv"
+            statement_path.write_text(
+                "\n".join(["Date,Description,Amount", "04/13/2026,VISA PURCHASE,-1.00"]),
+                encoding="utf-8",
+            )
+            parsed = parse_bank_statement_file(statement_path)
+            legacy_key = f"bank:guid-card:{parsed.rows[0].legacy_row_ids[0]}"
+            dedupe_store.mark_imported("book-1", [legacy_key])
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=CarryoverStore(db_path),
+                mapping=MappingConfig(
+                    bank_merchant_accounts={bank_merchant_key("VISA PURCHASE"): "guid-exp-card"}
+                ),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-card", "statement_directory": str(tmp_path)}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+
+        bank_rows = [row for row in plan.transactions if row.transaction.marketplace == "bank"]
+        self.assertEqual(len(bank_rows), 1)
+        self.assertEqual(bank_rows[0].status, "duplicate")
 
     def test_build_plan_exposes_balance_sheet_transfer_anchor_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

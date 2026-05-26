@@ -103,6 +103,7 @@ class BankStatementRow:
     source_path: str
     source_format: str
     raw: Mapping[str, str]
+    legacy_row_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,7 @@ class PlannedTransaction:
     clearing_amount: Decimal
     splits: tuple[PlannedSplit, ...]
     source_row_ids: tuple[str, ...]
+    dedupe_aliases: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
 

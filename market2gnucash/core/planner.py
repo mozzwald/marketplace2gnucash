@@ -532,7 +532,12 @@ def build_plan(
         )
 
     dedupe_keys = [txn.dedupe_key for txn in all_transactions]
-    existing = dedupe_store.existing_keys(book_id, dedupe_keys)
+    dedupe_lookup_keys = [
+        key
+        for txn in all_transactions
+        for key in (txn.dedupe_key, *txn.dedupe_aliases)
+    ]
+    existing = dedupe_store.existing_keys(book_id, dedupe_lookup_keys)
     duplicate_in_plan_keys = {
         key for key, count in Counter(dedupe_keys).items() if count > 1
     }
@@ -546,7 +551,8 @@ def build_plan(
     for txn in sorted(all_transactions, key=lambda value: (value.date, value.marketplace, value.txn_kind, value.txn_id)):
         duplicate_in_selected_inputs = txn.dedupe_key in seen_plan_keys
         seen_plan_keys.add(txn.dedupe_key)
-        status, reason = _status_for_transaction(txn.warnings, txn.dedupe_key in existing or duplicate_in_selected_inputs)
+        imported_before = txn.dedupe_key in existing or any(alias in existing for alias in txn.dedupe_aliases)
+        status, reason = _status_for_transaction(txn.warnings, imported_before or duplicate_in_selected_inputs)
         if duplicate_in_selected_inputs and status == "duplicate":
             reason = "Duplicate in selected inputs"
         statuses.append(

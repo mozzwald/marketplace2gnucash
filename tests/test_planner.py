@@ -7,8 +7,15 @@ from decimal import Decimal
 from pathlib import Path
 
 from market2gnucash.core.carryover_store import CarryoverStore
-from market2gnucash.core.dedupe_store import DedupeStore
-from market2gnucash.core.models import MappingConfig, MarketplaceAccountMapping, TransferAnchor
+from market2gnucash.core.dedupe_store import DedupeStore, planned_transaction_fingerprint
+from market2gnucash.core.models import (
+    CarryoverCandidate,
+    MappingConfig,
+    MarketplaceAccountMapping,
+    PlannedSplit,
+    PlannedTransaction,
+    TransferAnchor,
+)
 from market2gnucash.core.parsers import parse_bank_statement_file
 from market2gnucash.core.planner import build_plan
 from market2gnucash.core.rules import bank_merchant_key, ebay_standalone_fee_mapping_key
@@ -222,6 +229,77 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("Duplicate Etsy statement file selected", warnings)
         self.assertIn("Duplicate Etsy SoldOrders file selected", warnings)
 
+    def test_build_plan_warns_when_different_etsy_paths_have_identical_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            first_dir = tmp_path / "shop-a"
+            second_dir = tmp_path / "shop-b"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            first_statement, first_sold = self._write_etsy_exports(
+                first_dir,
+                year=2026,
+                month=6,
+                order_ids=["1001", "1002"],
+            )
+            second_statement = second_dir / first_statement.name
+            second_sold = second_dir / first_sold.name
+            second_statement.write_text(first_statement.read_text(encoding="utf-8"), encoding="utf-8")
+            second_sold.write_text(first_sold.read_text(encoding="utf-8"), encoding="utf-8")
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "etsy:shop-a": MarketplaceAccountMapping(
+                        marketplace="etsy",
+                        account_label="Shop A",
+                        clearing_guid="guid-clearing-a",
+                        income_guid="guid-income-a",
+                        refunds_guid="guid-refunds",
+                    ),
+                    "etsy:shop-b": MarketplaceAccountMapping(
+                        marketplace="etsy",
+                        account_label="Shop B",
+                        clearing_guid="guid-clearing-b",
+                        income_guid="guid-income-b",
+                        refunds_guid="guid-refunds",
+                    ),
+                }
+            )
+
+            plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(tmp_path / "dedupe.sqlite3"),
+                carryover_store=CarryoverStore(tmp_path / "dedupe.sqlite3"),
+                mapping=mapping,
+                marketplace_imports=[
+                    {
+                        "import_id": "import-a",
+                        "marketplace": "etsy",
+                        "account_key": "etsy:shop-a",
+                        "account_label": "Shop A",
+                        "etsy_monthly_exports": [
+                            {"statement_path": str(first_statement), "sold_orders_path": str(first_sold)}
+                        ],
+                    },
+                    {
+                        "import_id": "import-b",
+                        "marketplace": "etsy",
+                        "account_key": "etsy:shop-b",
+                        "account_label": "Shop B",
+                        "etsy_monthly_exports": [
+                            {"statement_path": str(second_statement), "sold_orders_path": str(second_sold)}
+                        ],
+                    },
+                ],
+                bank_imports=[],
+                start_date=date(2026, 7, 1),
+                end_date=date(2026, 7, 31),
+            )
+
+        warnings = "\n".join(plan.warnings)
+        self.assertIn("Shop A, Shop B contain overlapping export content", warnings)
+        self.assertIn("2 identical statement row(s)", warnings)
+        self.assertIn("2 identical SoldOrders row(s)", warnings)
+
     def test_build_plan_supports_multiple_marketplace_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             dedupe_store = DedupeStore(Path(tmp_dir) / "dedupe.sqlite3")
@@ -433,6 +511,109 @@ class PlannerTests(unittest.TestCase):
 
             carryover_store.resolve_candidates("book-1", list(february_plan.matched_carryover_candidate_keys))
             self.assertEqual(carryover_store.pending_count("book-1"), 0)
+
+    def test_invalidating_conflicting_carryover_resolves_marketplace_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "dedupe.sqlite3"
+            carryover_store = CarryoverStore(db_path)
+            bank_path = tmp_path / "checking.csv"
+            bank_path.write_text(
+                "\n".join(
+                    [
+                        "Date,Description,Amount,Reference",
+                        "06/08/2026,ETSY PAYOUT,46.64,BANK1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            candidates = []
+            for account_key, account_label, clearing_guid in (
+                ("etsy:shop-a", "Shop A", "guid-clearing-a"),
+                ("etsy:shop-b", "Shop B", "guid-clearing-b"),
+            ):
+                transaction = PlannedTransaction(
+                    dedupe_key=f"etsy:deposit:carry:{account_key}:deposit-1",
+                    marketplace="etsy",
+                    marketplace_account_key=account_key,
+                    marketplace_account_label=account_label,
+                    txn_kind="deposit_match",
+                    txn_id="deposit-1",
+                    date=date(2026, 6, 5),
+                    description="$46.64 sent to your bank account",
+                    external_ref="deposit-1",
+                    clearing_amount=Decimal("46.64"),
+                    splits=(
+                        PlannedSplit(
+                            account_guid=clearing_guid,
+                            amount=Decimal("46.64"),
+                            memo="Etsy deposit",
+                            mapping_key="etsy:deposit-match",
+                        ),
+                        PlannedSplit(
+                            account_guid=None,
+                            amount=Decimal("-46.64"),
+                            memo="Offset",
+                            mapping_key="etsy:deposit-match-offset",
+                        ),
+                    ),
+                    source_row_ids=("deposit-1",),
+                )
+                candidates.append(
+                    CarryoverCandidate(
+                        candidate_key=transaction.dedupe_key,
+                        candidate_type="deposit",
+                        source_scope=account_key,
+                        txn_date=transaction.date,
+                        amount=transaction.clearing_amount,
+                        description=transaction.description,
+                        payload={"transaction": CarryoverStore.serialize_transaction(transaction)},
+                        transaction=transaction,
+                    )
+                )
+            carryover_store.upsert_pending_candidates("book-1", candidates)
+            carryover_store.invalidate_candidates(
+                "book-1",
+                [candidates[1].candidate_key],
+                "Export was assigned to the wrong marketplace account",
+            )
+
+            matched_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=carryover_store,
+                mapping=MappingConfig(),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-bank", "statement_paths": [str(bank_path)], "csv_profiles": {}}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+
+            self.assertEqual(matched_plan.bank_match_results[0].status, "matched")
+            self.assertEqual(
+                matched_plan.bank_match_results[0].targets[0].account_guid,
+                "guid-clearing-a",
+            )
+
+            carryover_store.restore_candidates("book-1", [candidates[1].candidate_key])
+            ambiguous_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=DedupeStore(db_path),
+                carryover_store=carryover_store,
+                mapping=MappingConfig(),
+                marketplace_imports=[],
+                bank_imports=[
+                    {"account_guid": "guid-bank", "statement_paths": [str(bank_path)], "csv_profiles": {}}
+                ],
+                start_date=None,
+                end_date=None,
+            )
+
+        self.assertEqual(ambiguous_plan.bank_match_results[0].status, "ambiguous")
+        self.assertEqual(len(ambiguous_plan.bank_match_results[0].matched_transaction_ids), 2)
 
     def test_build_plan_only_imports_new_identical_etsy_listing_fees_after_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1059,8 +1240,8 @@ class PlannerTests(unittest.TestCase):
                 end_date=None,
             )
             first_fees = [row for row in first_plan.transactions if row.transaction.txn_kind == "other_fee"]
-            self.assertEqual(len(first_fees), 3)
-            self.assertEqual(sum(1 for row in first_fees if row.status == "ready"), 3)
+            self.assertEqual(len(first_fees), 2)
+            self.assertEqual(sum(1 for row in first_fees if row.status == "ready"), 2)
             dedupe_store.mark_imported("book-1", [row.transaction.dedupe_key for row in first_fees])
 
             third_path = tmp_path / "report-c.csv"
@@ -1095,9 +1276,85 @@ class PlannerTests(unittest.TestCase):
                 end_date=None,
             )
             second_fees = [row for row in second_plan.transactions if row.transaction.txn_kind == "other_fee"]
-            self.assertEqual(len(second_fees), 6)
-            self.assertEqual(sum(1 for row in second_fees if row.status == "duplicate"), 3)
-            self.assertEqual(sum(1 for row in second_fees if row.status == "ready"), 3)
+            self.assertEqual(len(second_fees), 3)
+            self.assertEqual(sum(1 for row in second_fees if row.status == "duplicate"), 2)
+            self.assertEqual(sum(1 for row in second_fees if row.status == "ready"), 1)
+
+    def test_build_plan_blocks_imported_key_when_financial_contents_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            report_path = tmp_path / "report.csv"
+            header = "Transaction creation date,Type,Order number,Payout currency,Net amount,Item subtotal,Shipping and handling,Seller collected tax,eBay collected tax,Description,Reference ID,Payout ID,Transaction ID,Legacy order ID,Final Value Fee - fixed"
+
+            def write_report(amount: str) -> None:
+                report_path.write_text(
+                    "\n".join(
+                        [
+                            "metadata line",
+                            header,
+                            f'"Jun 13, 2026",Order,04-14775-28570,USD,{amount},{amount},0.00,0.00,0.00,Sale,REF1,PAY1,TXN1,,0.00',
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            dedupe_store = DedupeStore(tmp_path / "dedupe.sqlite3")
+            carryover_store = CarryoverStore(tmp_path / "dedupe.sqlite3")
+            mapping = MappingConfig(
+                marketplace_accounts={
+                    "ebay:main": MarketplaceAccountMapping(
+                        marketplace="ebay",
+                        account_label="eBay Main",
+                        clearing_guid="guid-asset-ebay",
+                        income_guid="guid-income-ebay",
+                        refunds_guid="guid-refunds-ebay",
+                    )
+                }
+            )
+            marketplace_imports = [
+                {
+                    "import_id": "ebay-import",
+                    "marketplace": "ebay",
+                    "account_key": "ebay:main",
+                    "account_label": "eBay Main",
+                    "ebay_report_directory": str(tmp_path),
+                }
+            ]
+
+            write_report("29.66")
+            first_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=marketplace_imports,
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+            sale = next(row.transaction for row in first_plan.transactions if row.transaction.txn_kind == "sale")
+            dedupe_store.mark_imported(
+                "book-1",
+                [sale.dedupe_key],
+                {sale.dedupe_key: planned_transaction_fingerprint(sale)},
+            )
+
+            write_report("59.32")
+            second_plan = build_plan(
+                book_id="book-1",
+                dedupe_store=dedupe_store,
+                carryover_store=carryover_store,
+                mapping=mapping,
+                marketplace_imports=marketplace_imports,
+                bank_imports=[],
+                start_date=None,
+                end_date=None,
+            )
+
+        changed_sale = next(row for row in second_plan.transactions if row.transaction.txn_kind == "sale")
+        self.assertEqual(changed_sale.status, "blocked")
+        self.assertEqual(changed_sale.status_reason, "Imported transaction contents changed")
+        self.assertTrue(any("different financial contents" in warning for warning in second_plan.warnings))
 
     def test_build_plan_reports_missing_ebay_report_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

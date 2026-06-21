@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -19,7 +20,12 @@ from PySide6.QtWidgets import (
 )
 
 from market2gnucash.core.decimal_utils import ZERO
-from market2gnucash.core.models import AccountRecord, MappingConfig, PlannedTransactionStatus
+from market2gnucash.core.models import (
+    AccountRecord,
+    CarryoverCandidate,
+    MappingConfig,
+    PlannedTransactionStatus,
+)
 from market2gnucash.core.planner import build_plan
 from market2gnucash.ui.account_picker import AccountPickerDialog
 
@@ -166,6 +172,76 @@ class TransferOverrideDialog(QDialog):
         if dedupe_item is None:
             return None
         value = dedupe_item.data(Qt.ItemDataRole.UserRole)
+        return value if isinstance(value, str) else None
+
+
+class InvalidateCarryoverDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        candidates: list[CarryoverCandidate],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Invalidate Carryover")
+        self.resize(850, 400)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Select the stale carryover record. It will remain in the database for audit history."
+            )
+        )
+
+        self.candidates_table = QTableWidget()
+        self.candidates_table.setColumnCount(6)
+        self.candidates_table.setHorizontalHeaderLabels(
+            ["Date", "Marketplace", "Market Acct", "Type", "Amount", "Description"]
+        )
+        self.candidates_table.setRowCount(len(candidates))
+        self.candidates_table.verticalHeader().setVisible(False)
+        self.candidates_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.candidates_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.candidates_table.setSortingEnabled(False)
+
+        for row_index, candidate in enumerate(candidates):
+            txn = candidate.transaction
+            row_items = [
+                QTableWidgetItem(candidate.txn_date.isoformat()),
+                QTableWidgetItem(txn.marketplace),
+                QTableWidgetItem(txn.marketplace_account_label or candidate.source_scope),
+                QTableWidgetItem(candidate.candidate_type),
+                QTableWidgetItem(str(candidate.amount)),
+                QTableWidgetItem(candidate.description),
+            ]
+            row_items[0].setData(Qt.ItemDataRole.UserRole, candidate.candidate_key)
+            for col_index, item in enumerate(row_items):
+                self.candidates_table.setItem(row_index, col_index, item)
+
+        self.candidates_table.setSortingEnabled(True)
+        self.candidates_table.resizeColumnsToContents()
+        if candidates:
+            self.candidates_table.selectRow(0)
+        layout.addWidget(self.candidates_table)
+
+        buttons_row = QHBoxLayout()
+        invalidate_button = QPushButton("Invalidate Selected")
+        invalidate_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons_row.addStretch()
+        buttons_row.addWidget(invalidate_button)
+        buttons_row.addWidget(cancel_button)
+        layout.addLayout(buttons_row)
+
+    def selected_candidate_key(self) -> str | None:
+        selected_items = self.candidates_table.selectedItems()
+        if not selected_items:
+            return None
+        key_item = self.candidates_table.item(selected_items[0].row(), 0)
+        if key_item is None:
+            return None
+        value = key_item.data(Qt.ItemDataRole.UserRole)
         return value if isinstance(value, str) else None
 
 
@@ -336,8 +412,16 @@ class BankMappingTab(QWidget):
             clear_match_button.clicked.connect(
                 lambda _checked=False, dedupe_key=match_result.bank_dedupe_key: self._clear_match_override(dedupe_key)
             )
+            invalidate_carryover_button = QPushButton("Invalidate Carryover")
+            invalidate_carryover_button.clicked.connect(
+                lambda _checked=False, dedupe_key=match_result.bank_dedupe_key: self._invalidate_carryover(dedupe_key)
+            )
+            invalidate_carryover_button.setEnabled(
+                bool(self._pending_carryovers_for_match(match_result.matched_transaction_ids))
+            )
             actions_layout.addWidget(match_button)
             actions_layout.addWidget(clear_match_button)
+            actions_layout.addWidget(invalidate_carryover_button)
             transfer_button = QPushButton("Transfer Match")
             transfer_button.clicked.connect(
                 lambda _checked=False, dedupe_key=match_result.bank_dedupe_key: self._edit_transfer_override(dedupe_key)
@@ -468,6 +552,67 @@ class BankMappingTab(QWidget):
             if item is not None:
                 item.setBackground(yellow)
                 item.setForeground(black)
+
+    def _pending_carryovers_for_match(
+        self,
+        matched_transaction_ids: tuple[str, ...],
+    ) -> list[CarryoverCandidate]:
+        book_id = self.app_state.get("book_id")
+        if not book_id or not matched_transaction_ids:
+            return []
+        matched_ids = set(matched_transaction_ids)
+        return [
+            candidate
+            for candidate in self.app_state["carryover_store"].list_pending_candidates(book_id)
+            if candidate.candidate_key in matched_ids
+        ]
+
+    def _invalidate_carryover(self, bank_dedupe_key: str) -> None:
+        book_id = self.app_state.get("book_id")
+        plan = self.app_state.get("plan_result")
+        if not book_id or plan is None:
+            QMessageBox.warning(self, "No Preview", "Generate a preview before invalidating carryovers.")
+            return
+
+        match_result = next(
+            (result for result in plan.bank_match_results if result.bank_dedupe_key == bank_dedupe_key),
+            None,
+        )
+        if match_result is None:
+            QMessageBox.warning(self, "Match Missing", "Could not locate the selected bank/card match row.")
+            return
+
+        candidates = self._pending_carryovers_for_match(match_result.matched_transaction_ids)
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "No Carryover",
+                "This marketplace match does not contain a pending carryover record.",
+            )
+            return
+
+        dialog = InvalidateCarryoverDialog(candidates=candidates, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        candidate_key = dialog.selected_candidate_key()
+        if not candidate_key:
+            return
+
+        reason, accepted = QInputDialog.getText(
+            self,
+            "Invalidation Reason",
+            "Why is this carryover invalid?",
+            text="Export was assigned to the wrong marketplace account",
+        )
+        if not accepted or not reason.strip():
+            return
+
+        self.app_state["carryover_store"].invalidate_candidates(
+            book_id,
+            [candidate_key],
+            reason,
+        )
+        self._rebuild_plan()
 
     def _marketplace_candidate_rows(self) -> list[PlannedTransactionStatus]:
         plan = self.app_state.get("plan_result")

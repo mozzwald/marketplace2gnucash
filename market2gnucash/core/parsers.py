@@ -191,6 +191,28 @@ def _ebay_report_signature(row: EbayReportRow) -> list[str]:
     ]
 
 
+def _ebay_source_value(value: str | None) -> str | None:
+    normalized = (value or "").strip()
+    if not normalized or normalized.lower() in {"--", "-", "n/a", "na", "none"}:
+        return None
+    return normalized
+
+
+def _ebay_source_identity(row: EbayReportRow) -> tuple[str, str, str] | None:
+    transaction_id = _ebay_source_value(row.raw.get("Transaction ID"))
+    if transaction_id:
+        return (row.row_type, "transaction", transaction_id)
+
+    reference_id = _ebay_source_value(row.raw.get("Reference ID"))
+    if reference_id and row.row_type in {"Shipping label", "Other fee", "Refund", "Charge", "Payout"}:
+        return (row.row_type, "reference", reference_id)
+    return None
+
+
+def _ebay_row_completeness(row: EbayReportRow) -> int:
+    return sum(1 for value in row.raw.values() if _ebay_source_value(value) is not None)
+
+
 def _bank_statement_signature(row: BankStatementRow) -> list[str]:
     return [
         row.date.isoformat(),
@@ -1023,10 +1045,24 @@ def parse_ebay_reports(
     end_date: date | None = None,
 ) -> EbayInputData:
     rows: list[EbayReportRow] = []
+    row_index_by_identity: dict[tuple[str, str, str], int] = {}
     fee_columns: set[str] = set()
     for path in _as_path_tuple(paths):
         report = parse_ebay_report(path, start_date, end_date)
-        rows.extend(report.report_rows)
+        for row in report.report_rows:
+            identity = _ebay_source_identity(row)
+            if identity is None:
+                rows.append(row)
+                continue
+
+            existing_index = row_index_by_identity.get(identity)
+            if existing_index is None:
+                row_index_by_identity[identity] = len(rows)
+                rows.append(row)
+                continue
+
+            if _ebay_row_completeness(row) >= _ebay_row_completeness(rows[existing_index]):
+                rows[existing_index] = row
         fee_columns.update(report.fee_columns)
     return EbayInputData(
         report_rows=_assign_occurrence_row_ids(

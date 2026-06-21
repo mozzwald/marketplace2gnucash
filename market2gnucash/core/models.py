@@ -305,6 +305,8 @@ class CarryoverCandidate:
     description: str
     payload: Mapping[str, Any]
     transaction: PlannedTransaction
+    invalidated_at: str | None = None
+    invalidation_reason: str | None = None
 
 
 @dataclass(frozen=True)

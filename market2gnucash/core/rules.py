@@ -672,7 +672,7 @@ def build_ebay_transactions(
     for row in rows:
         if row.row_type == "Order" and row.order_number:
             by_order[row.order_number].append(row)
-        elif row.row_type == "Other fee":
+        elif row.row_type in {"Other fee", "Shipping label"}:
             mapping_keys.add(ebay_standalone_fee_mapping_key(row.row_type))
 
     consumed_rows: set[str] = set()
@@ -864,16 +864,23 @@ def build_ebay_transactions(
 
     default_fee_account_guid = _unique_fee_account_guid(account_mapping)
     for row in rows:
-        if row.row_type != "Other fee":
+        if row.row_type not in {"Other fee", "Shipping label"}:
             continue
 
-        fee_warnings: list[str] = []
+        expense_warnings: list[str] = []
         mapping_key = ebay_standalone_fee_mapping_key(row.row_type)
-        fee_account_guid = account_mapping.fee_accounts.get(mapping_key) or default_fee_account_guid
-        if fee_account_guid is None:
-            fee_warnings.append(
-                "UNMAPPED: No default eBay fee account available for standalone Other fee rows"
-            )
+        expense_account_guid = account_mapping.fee_accounts.get(mapping_key)
+        if row.row_type == "Other fee" and expense_account_guid is None:
+            expense_account_guid = default_fee_account_guid
+        if expense_account_guid is None:
+            expense_warnings.append(f"UNMAPPED: No eBay mapping for {mapping_key}")
+
+        transaction_kind = "other_fee" if row.row_type == "Other fee" else "shipping_label"
+        description = _first_nonempty(
+            row.description,
+            row.raw.get("Reference ID", ""),
+            f"eBay {row.row_type}",
+        ) or f"eBay {row.row_type}"
 
         splits: list[PlannedSplit] = []
         if account_mapping.clearing_guid:
@@ -881,43 +888,43 @@ def build_ebay_transactions(
                 PlannedSplit(
                     account_guid=account_mapping.clearing_guid,
                     amount=row.net_amount,
-                    memo=f"Other fee net {row.row_id}",
+                    memo=f"{row.row_type} net {row.row_id}",
                 )
             )
         else:
-            fee_warnings.append("MISSING_ACCOUNT: eBay clearing account is not selected")
+            expense_warnings.append("MISSING_ACCOUNT: eBay clearing account is not selected")
             splits.append(
                 PlannedSplit(
                     account_guid=None,
                     amount=row.net_amount,
-                    memo=f"Other fee net {row.row_id}",
+                    memo=f"{row.row_type} net {row.row_id}",
                 )
             )
 
         splits.append(
             PlannedSplit(
-                account_guid=fee_account_guid,
+                account_guid=expense_account_guid,
                 amount=-row.net_amount,
-                memo=row.description or "eBay Other fee",
+                memo=description,
                 mapping_key=mapping_key,
             )
         )
 
         transactions.append(
             _finalize_transaction(
-                dedupe_key=f"ebay:other_fee:{account_key}:{row.row_id}",
+                dedupe_key=f"ebay:{transaction_kind}:{account_key}:{row.row_id}",
                 marketplace="ebay",
                 marketplace_account_key=account_key,
                 marketplace_account_label=account_label,
-                txn_kind="other_fee",
+                txn_kind=transaction_kind,
                 txn_id=row.row_id,
                 txn_date=row.date,
-                description=_first_nonempty(row.description, "eBay Other fee") or "eBay Other fee",
+                description=description,
                 external_ref=row.raw.get("Reference ID") or row.row_id,
                 clearing_amount=row.net_amount,
                 splits=splits,
                 source_row_ids=[row.row_id],
-                warnings=fee_warnings,
+                warnings=expense_warnings,
             )
         )
         consumed_rows.add(row.row_id)

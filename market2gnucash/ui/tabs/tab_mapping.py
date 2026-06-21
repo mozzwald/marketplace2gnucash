@@ -141,8 +141,8 @@ class MappingTab(QWidget):
             self.fee_table.setHorizontalHeaderLabels(["Etsy Key", "Account", "Action"])
             self._populate_fee_table(sorted(mapping_keys), account_mapping)
         else:
-            self.fee_label.setText("eBay Fee Column Mapping")
-            self.fee_table.setHorizontalHeaderLabels(["eBay Fee Column", "Account", "Action"])
+            self.fee_label.setText("eBay Expense and Fee Mapping")
+            self.fee_table.setHorizontalHeaderLabels(["eBay Mapping Key", "Account", "Action"])
             self._populate_fee_table(sorted(mapping_keys), account_mapping)
 
     def _marketplace_imports(self) -> list[dict[str, object]]:
@@ -290,8 +290,9 @@ class MappingTab(QWidget):
                         end_date,
                     )
                     found_keys.update(ebay_mapping_key(column) for column in ebay_data.fee_columns)
-                    if any(row.row_type == "Other fee" for row in ebay_data.report_rows):
-                        found_keys.add(ebay_standalone_fee_mapping_key())
+                    for row_type in ("Other fee", "Shipping label"):
+                        if any(row.row_type == row_type for row in ebay_data.report_rows):
+                            found_keys.add(ebay_standalone_fee_mapping_key(row_type))
                 mapping_keys[str(marketplace_import["account_key"])] = tuple(sorted(found_keys))
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))

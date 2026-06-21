@@ -7,7 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from market2gnucash.core.carryover_store import CarryoverStore
-from market2gnucash.core.dedupe_store import DedupeStore
+from market2gnucash.core.dedupe_store import DedupeStore, planned_transaction_fingerprint
 from market2gnucash.core.models import (
     BankCsvProfile,
     BankImportSpec,
@@ -262,6 +262,8 @@ def build_plan(
     bank_category_results = ()
     bank_txns = ()
     marketplace_payout_candidates = ()
+    etsy_statement_owners: dict[str, set[str]] = {}
+    etsy_sold_order_owners: dict[str, set[str]] = {}
     transfer_anchor_candidates: tuple[TransferAnchor, ...] = ()
     matched_transfer_anchor_resolutions: tuple[TransferAnchorResolution, ...] = ()
     matched_carryover_candidate_keys: tuple[str, ...] = ()
@@ -293,11 +295,27 @@ def build_plan(
     for marketplace_import in normalized_marketplace_imports:
         if marketplace_import.marketplace == "etsy":
             statement_paths, sold_orders_paths, input_warnings = _validate_etsy_exports(marketplace_import)
-            etsy_data = parse_etsy_inputs(
+            etsy_content_data = parse_etsy_inputs(
                 statement_path=statement_paths,
                 sold_orders_path=sold_orders_paths,
-                start_date=start_date,
-                end_date=end_date,
+            )
+            for row in etsy_content_data.statement_rows:
+                etsy_statement_owners.setdefault(row.row_id, set()).add(
+                    marketplace_import.account_label
+                )
+            for row in etsy_content_data.sold_orders:
+                etsy_sold_order_owners.setdefault(row.row_id, set()).add(
+                    marketplace_import.account_label
+                )
+            etsy_data = (
+                etsy_content_data
+                if start_date is None and end_date is None
+                else parse_etsy_inputs(
+                    statement_path=statement_paths,
+                    sold_orders_path=sold_orders_paths,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
             )
             etsy_txns, etsy_warnings, etsy_mapping_keys = build_etsy_transactions(
                 etsy_data,
@@ -381,6 +399,28 @@ def build_plan(
             all_warnings.extend(
                 f"[{marketplace_import.account_label}] {warning}" for warning in ebay_warnings
             )
+
+    duplicate_etsy_content: dict[tuple[str, ...], dict[str, int]] = {}
+    for row_owners, content_type in (
+        (etsy_statement_owners, "statement"),
+        (etsy_sold_order_owners, "SoldOrders"),
+    ):
+        for owners in row_owners.values():
+            if len(owners) < 2:
+                continue
+            owner_key = tuple(sorted(owners))
+            counts = duplicate_etsy_content.setdefault(owner_key, {})
+            counts[content_type] = counts.get(content_type, 0) + 1
+    for owners, counts in sorted(duplicate_etsy_content.items()):
+        details = ", ".join(
+            f"{count} identical {content_type} row(s)"
+            for content_type, count in sorted(counts.items())
+        )
+        all_warnings.append(
+            "WARNING: Etsy accounts "
+            f"{', '.join(owners)} contain overlapping export content ({details}). "
+            "The same export may have been assigned to more than one marketplace account."
+        )
 
     current_carryover_candidates = tuple(
         _carryover_candidate_from_transaction(transaction)
@@ -538,6 +578,7 @@ def build_plan(
         for key in (txn.dedupe_key, *txn.dedupe_aliases)
     ]
     existing = dedupe_store.existing_keys(book_id, dedupe_lookup_keys)
+    imported_fingerprints = dedupe_store.imported_fingerprints(book_id, dedupe_lookup_keys)
     duplicate_in_plan_keys = {
         key for key, count in Counter(dedupe_keys).items() if count > 1
     }
@@ -551,8 +592,23 @@ def build_plan(
     for txn in sorted(all_transactions, key=lambda value: (value.date, value.marketplace, value.txn_kind, value.txn_id)):
         duplicate_in_selected_inputs = txn.dedupe_key in seen_plan_keys
         seen_plan_keys.add(txn.dedupe_key)
-        imported_before = txn.dedupe_key in existing or any(alias in existing for alias in txn.dedupe_aliases)
-        status, reason = _status_for_transaction(txn.warnings, imported_before or duplicate_in_selected_inputs)
+        imported_key = next(
+            (key for key in (txn.dedupe_key, *txn.dedupe_aliases) if key in existing),
+            None,
+        )
+        imported_before = imported_key is not None
+        stored_fingerprint = imported_fingerprints.get(imported_key) if imported_key else None
+        fingerprint_changed = (
+            stored_fingerprint is not None
+            and stored_fingerprint != planned_transaction_fingerprint(txn)
+        )
+        if fingerprint_changed:
+            status, reason = "blocked", "Imported transaction contents changed"
+            all_warnings.append(
+                f"WARNING: Imported transaction {txn.dedupe_key} now has different financial contents; review the source exports before importing."
+            )
+        else:
+            status, reason = _status_for_transaction(txn.warnings, imported_before or duplicate_in_selected_inputs)
         if duplicate_in_selected_inputs and status == "duplicate":
             reason = "Duplicate in selected inputs"
         statuses.append(

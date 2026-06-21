@@ -35,10 +35,20 @@ class CarryoverStore:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     resolved_at TEXT,
+                    invalidated_at TEXT,
+                    invalidation_reason TEXT,
                     PRIMARY KEY (book_id, candidate_key)
                 )
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(carryover_candidates)").fetchall()
+            }
+            if "invalidated_at" not in columns:
+                conn.execute("ALTER TABLE carryover_candidates ADD COLUMN invalidated_at TEXT")
+            if "invalidation_reason" not in columns:
+                conn.execute("ALTER TABLE carryover_candidates ADD COLUMN invalidation_reason TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_carryover_pending
@@ -80,8 +90,17 @@ class CarryoverStore:
                     amount=excluded.amount,
                     description=excluded.description,
                     payload_json=excluded.payload_json,
-                    status='pending',
-                    resolved_at=NULL
+                    status=CASE
+                        WHEN carryover_candidates.status = 'invalidated' THEN 'invalidated'
+                        ELSE 'pending'
+                    END,
+                    resolved_at=CASE
+                        WHEN carryover_candidates.status = 'invalidated'
+                        THEN carryover_candidates.resolved_at
+                        ELSE NULL
+                    END,
+                    invalidated_at=carryover_candidates.invalidated_at,
+                    invalidation_reason=carryover_candidates.invalidation_reason
                 """,
                 rows,
             )
@@ -111,6 +130,33 @@ class CarryoverStore:
             for row in rows
         )
 
+    def list_invalidated_candidates(self, book_id: str) -> tuple[CarryoverCandidate, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT candidate_key, candidate_type, source_scope, txn_date, amount,
+                       description, payload_json, invalidated_at, invalidation_reason
+                FROM carryover_candidates
+                WHERE book_id = ? AND status = 'invalidated'
+                ORDER BY invalidated_at DESC, txn_date, candidate_key
+                """,
+                (book_id,),
+            ).fetchall()
+        return tuple(
+            self._row_to_candidate(
+                candidate_key=row[0],
+                candidate_type=row[1],
+                source_scope=row[2],
+                txn_date=row[3],
+                amount=row[4],
+                description=row[5],
+                payload_json=row[6],
+                invalidated_at=row[7],
+                invalidation_reason=row[8],
+            )
+            for row in rows
+        )
+
     def pending_count(self, book_id: str | None = None) -> int:
         query = "SELECT COUNT(*) FROM carryover_candidates WHERE status = 'pending'"
         params: tuple[str, ...] = ()
@@ -136,6 +182,65 @@ class CarryoverStore:
             )
             conn.commit()
 
+    def invalidate_candidates(
+        self,
+        book_id: str,
+        candidate_keys: list[str] | tuple[str, ...],
+        reason: str,
+    ) -> None:
+        if not candidate_keys:
+            return
+        invalidated_at = datetime.now(UTC).isoformat()
+        normalized_reason = reason.strip()
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                UPDATE carryover_candidates
+                SET status = 'invalidated',
+                    invalidated_at = ?,
+                    invalidation_reason = ?,
+                    resolved_at = NULL
+                WHERE book_id = ? AND candidate_key = ? AND status = 'pending'
+                """,
+                [
+                    (invalidated_at, normalized_reason, book_id, key)
+                    for key in candidate_keys
+                ],
+            )
+            conn.commit()
+
+    def restore_candidates(
+        self,
+        book_id: str,
+        candidate_keys: list[str] | tuple[str, ...],
+    ) -> None:
+        if not candidate_keys:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                UPDATE carryover_candidates
+                SET status = 'pending',
+                    invalidated_at = NULL,
+                    invalidation_reason = NULL,
+                    resolved_at = NULL
+                WHERE book_id = ? AND candidate_key = ? AND status = 'invalidated'
+                """,
+                [(book_id, key) for key in candidate_keys],
+            )
+            conn.commit()
+
+    def clear_pending(self, book_id: str | None = None) -> None:
+        with self._connect() as conn:
+            if book_id is None:
+                conn.execute("DELETE FROM carryover_candidates WHERE status = 'pending'")
+            else:
+                conn.execute(
+                    "DELETE FROM carryover_candidates WHERE book_id = ? AND status = 'pending'",
+                    (book_id,),
+                )
+            conn.commit()
+
     def clear_book(self, book_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM carryover_candidates WHERE book_id = ?", (book_id,))
@@ -156,6 +261,8 @@ class CarryoverStore:
         amount: str,
         description: str,
         payload_json: str,
+        invalidated_at: str | None = None,
+        invalidation_reason: str | None = None,
     ) -> CarryoverCandidate:
         payload = json.loads(payload_json)
         transaction = self._deserialize_transaction(payload["transaction"])
@@ -168,6 +275,8 @@ class CarryoverStore:
             description=description,
             payload=payload,
             transaction=transaction,
+            invalidated_at=invalidated_at,
+            invalidation_reason=invalidation_reason,
         )
 
     @staticmethod

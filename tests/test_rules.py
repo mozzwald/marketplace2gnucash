@@ -265,6 +265,94 @@ class RuleEngineTests(unittest.TestCase):
         self.assertEqual(txn.splits[1].account_guid, "guid-exp-subscription")
         self.assertEqual(txn.splits[1].mapping_key, ebay_standalone_fee_mapping_key())
 
+    def test_ebay_shipping_label_posts_to_clearing_and_shipping_expense(self) -> None:
+        shipping_key = ebay_standalone_fee_mapping_key("Shipping label")
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-shipping",
+                    row_number=1,
+                    date=date(2026, 6, 11),
+                    row_type="Shipping label",
+                    order_number="01-14772-84473",
+                    currency="USD",
+                    net_amount=Decimal("-7.88"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="UPS",
+                    raw={"Reference ID": "1Z14V5340328969825"},
+                ),
+            ),
+            fee_columns=(),
+        )
+        mapping = MappingConfig(
+            marketplace_accounts={
+                "ebay:main": MarketplaceAccountMapping(
+                    marketplace="ebay",
+                    account_label="eBay Main",
+                    clearing_guid="guid-asset-ebay",
+                    income_guid="guid-income-ebay",
+                    refunds_guid="guid-exp-refunds-ebay",
+                    fee_accounts={shipping_key: "guid-exp-shipping"},
+                )
+            }
+        )
+
+        transactions, warnings, mapping_keys = build_ebay_transactions(
+            ebay_data,
+            mapping,
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(warnings, ())
+        self.assertEqual(mapping_keys, (shipping_key,))
+        self.assertEqual(len(transactions), 1)
+        txn = transactions[0]
+        self.assertEqual(txn.txn_kind, "shipping_label")
+        self.assertEqual(txn.clearing_amount, Decimal("-7.88"))
+        self.assertEqual(txn.splits[0].account_guid, "guid-asset-ebay")
+        self.assertEqual(txn.splits[0].amount, Decimal("-7.88"))
+        self.assertEqual(txn.splits[1].account_guid, "guid-exp-shipping")
+        self.assertEqual(txn.splits[1].amount, Decimal("7.88"))
+        self.assertEqual(sum(split.amount for split in txn.splits), Decimal("0"))
+
+    def test_ebay_shipping_label_requires_explicit_mapping(self) -> None:
+        ebay_data = EbayInputData(
+            report_rows=(
+                EbayReportRow(
+                    row_id="row-shipping",
+                    row_number=1,
+                    date=date(2026, 6, 11),
+                    row_type="Shipping label",
+                    order_number=None,
+                    currency="USD",
+                    net_amount=Decimal("-7.88"),
+                    item_subtotal=Decimal("0.00"),
+                    shipping_and_handling=Decimal("0.00"),
+                    seller_collected_tax=Decimal("0.00"),
+                    ebay_collected_tax=Decimal("0.00"),
+                    fee_columns={},
+                    description="UPS",
+                    raw={"Reference ID": "TRACKING"},
+                ),
+            ),
+            fee_columns=(),
+        )
+
+        transactions, _warnings, _mapping_keys = build_ebay_transactions(
+            ebay_data,
+            self._ebay_mapping(("Final Value Fee - fixed",)),
+            account_key="ebay:main",
+            account_label="eBay Main",
+        )
+
+        self.assertEqual(len(transactions), 1)
+        self.assertTrue(any(warning.startswith("UNMAPPED") for warning in transactions[0].warnings))
+
     def test_ebay_charge_rows_generate_negative_bank_match_candidates(self) -> None:
         ebay_data = EbayInputData(
             report_rows=(

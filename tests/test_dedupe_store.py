@@ -6,8 +6,13 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from market2gnucash.core.dedupe_store import DedupeStore
-from market2gnucash.core.models import TransferAnchor, TransferAnchorResolution
+from market2gnucash.core.dedupe_store import DedupeStore, planned_transaction_fingerprint
+from market2gnucash.core.models import (
+    PlannedSplit,
+    PlannedTransaction,
+    TransferAnchor,
+    TransferAnchorResolution,
+)
 
 
 class DedupeStoreTests(unittest.TestCase):
@@ -25,6 +30,41 @@ class DedupeStoreTests(unittest.TestCase):
 
             existing = store.existing_keys(book_id, [*keys, "missing"])
             self.assertEqual(existing, set(keys))
+
+    def test_mark_imported_stores_financial_fingerprint(self) -> None:
+        transaction = PlannedTransaction(
+            dedupe_key="ebay:sale:main:order-1",
+            marketplace="ebay",
+            marketplace_account_key="main",
+            marketplace_account_label="Main",
+            txn_kind="sale",
+            txn_id="order-1",
+            date=date(2026, 6, 13),
+            description="Sale",
+            external_ref="order-1",
+            clearing_amount=Decimal("29.66"),
+            splits=(
+                PlannedSplit("clearing", Decimal("29.66"), "net"),
+                PlannedSplit("income", Decimal("-29.66"), "income"),
+            ),
+            source_row_ids=("row-1",),
+        )
+        fingerprint = planned_transaction_fingerprint(transaction)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DedupeStore(Path(tmp_dir) / "dedupe.sqlite3")
+            store.mark_imported(
+                "book-guid-123",
+                [transaction.dedupe_key],
+                {transaction.dedupe_key: fingerprint},
+            )
+
+            records = store.imported_fingerprints(
+                "book-guid-123",
+                [transaction.dedupe_key],
+            )
+
+        self.assertEqual(records, {transaction.dedupe_key: fingerprint})
 
     def test_clear_all_removes_import_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

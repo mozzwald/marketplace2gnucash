@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from market2gnucash.core.book_io import create_timestamped_backup, detect_book_locks
+from market2gnucash.core.dedupe_store import planned_transaction_fingerprint
 from market2gnucash.core.gnucash_writer import GnuCashWriter
 
 _BALANCE_SHEET_ACCOUNT_TYPES = {"ASSET", "BANK", "CASH", "CREDIT", "LIABILITY", "EQUITY"}
@@ -104,7 +105,19 @@ class ImportTab(QWidget):
 
                 result = writer.write_transactions(ready_transactions, progress_cb=on_progress)
                 written_keys = result.written_keys
-                self.app_state["dedupe_store"].mark_imported(book_id, list(written_keys))
+                transactions_by_key = {
+                    transaction.dedupe_key: transaction for transaction in ready_transactions
+                }
+                fingerprints = {
+                    key: planned_transaction_fingerprint(transactions_by_key[key])
+                    for key in written_keys
+                    if key in transactions_by_key
+                }
+                self.app_state["dedupe_store"].mark_imported(
+                    book_id,
+                    list(written_keys),
+                    fingerprints,
+                )
 
             ready_keys = set(written_keys)
             anchors_to_add = self._pending_transfer_anchors_for_import(plan, ready_keys)

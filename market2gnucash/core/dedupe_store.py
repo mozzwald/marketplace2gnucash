@@ -1,12 +1,36 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from market2gnucash.core.models import TransferAnchor, TransferAnchorResolution
+from market2gnucash.core.models import PlannedTransaction, TransferAnchor, TransferAnchorResolution
 from market2gnucash.core.paths import dedupe_db_path
+
+
+def planned_transaction_fingerprint(transaction: PlannedTransaction) -> str:
+    split_rows = sorted(
+        (
+            split.account_guid or "",
+            format(split.amount, "f"),
+            split.mapping_key or "",
+        )
+        for split in transaction.splits
+    )
+    payload = json.dumps(
+        {
+            "date": transaction.date.isoformat(),
+            "clearing_amount": format(transaction.clearing_amount, "f"),
+            "splits": split_rows,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class DedupeStore:
@@ -26,10 +50,16 @@ class DedupeStore:
                     book_id TEXT NOT NULL,
                     dedupe_key TEXT NOT NULL,
                     imported_at TEXT NOT NULL,
+                    financial_fingerprint TEXT,
                     PRIMARY KEY (book_id, dedupe_key)
                 )
                 """
             )
+            import_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()
+            }
+            if "financial_fingerprint" not in import_columns:
+                conn.execute("ALTER TABLE imports ADD COLUMN financial_fingerprint TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS transfer_anchors (
@@ -95,6 +125,18 @@ class DedupeStore:
             rows = conn.execute(query, [book_id, *dedupe_keys]).fetchall()
         return {row[0] for row in rows}
 
+    def imported_fingerprints(self, book_id: str, dedupe_keys: list[str]) -> dict[str, str | None]:
+        if not dedupe_keys:
+            return {}
+        placeholders = ",".join("?" for _ in dedupe_keys)
+        query = (
+            f"SELECT dedupe_key, financial_fingerprint FROM imports WHERE book_id = ? "
+            f"AND dedupe_key IN ({placeholders})"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(query, [book_id, *dedupe_keys]).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def is_imported(self, book_id: str, dedupe_key: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
@@ -103,14 +145,24 @@ class DedupeStore:
             ).fetchone()
         return row is not None
 
-    def mark_imported(self, book_id: str, dedupe_keys: list[str]) -> None:
+    def mark_imported(
+        self,
+        book_id: str,
+        dedupe_keys: list[str],
+        financial_fingerprints: Mapping[str, str] | None = None,
+    ) -> None:
         if not dedupe_keys:
             return
         timestamp = datetime.now(UTC).isoformat()
+        fingerprints = financial_fingerprints or {}
         with self._connect() as conn:
             conn.executemany(
-                "INSERT OR IGNORE INTO imports (book_id, dedupe_key, imported_at) VALUES (?, ?, ?)",
-                [(book_id, key, timestamp) for key in dedupe_keys],
+                """
+                INSERT OR IGNORE INTO imports (
+                    book_id, dedupe_key, imported_at, financial_fingerprint
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [(book_id, key, timestamp, fingerprints.get(key)) for key in dedupe_keys],
             )
             conn.commit()
 

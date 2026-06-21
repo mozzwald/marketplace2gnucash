@@ -48,27 +48,52 @@ class ParserTests(unittest.TestCase):
         self.assertGreater(len(order_rows), 0)
         self.assertTrue(all(isinstance(row.net_amount, Decimal) for row in order_rows))
 
-    def test_parse_ebay_reports_assigns_occurrences_across_files(self) -> None:
+    def test_parse_ebay_reports_dedupes_source_transactions_across_files(self) -> None:
+        header = "Transaction creation date,Type,Order number,Payout currency,Net amount,Item subtotal,Shipping and handling,Seller collected tax,eBay collected tax,Description,Reference ID,Payout ID,Transaction ID,Legacy order ID,Final Value Fee - fixed"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            first_path = Path(tmp_dir) / "report-a.csv"
+            second_path = Path(tmp_dir) / "report-b.csv"
+            first_path.write_text(
+                "\n".join(
+                    [
+                        "metadata line",
+                        header,
+                        '"Apr 13, 2026",Order,04-12345-67890,USD,29.66,35.00,0.00,0.00,0.00,Sale,REF1,--,TXN1,,0.00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            second_path.write_text(
+                "\n".join(
+                    [
+                        "metadata line",
+                        header,
+                        '"Apr 13, 2026",Order,04-12345-67890,USD,29.66,35.00,0.00,0.00,0.00,Sale,REF1,PAY1,TXN1,,0.00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            combined = parse_ebay_reports((first_path, second_path))
+
+        self.assertEqual(len(combined.report_rows), 1)
+        self.assertEqual(combined.report_rows[0].raw["Payout ID"], "PAY1")
+
+    def test_parse_ebay_reports_keeps_identical_rows_without_source_ids(self) -> None:
         report_text = "\n".join(
             [
                 "metadata line",
                 "Transaction creation date,Type,Order number,Payout currency,Net amount,Item subtotal,Shipping and handling,Seller collected tax,eBay collected tax,Description,Reference ID,Payout ID,Transaction ID,Legacy order ID,Final Value Fee - fixed",
-                '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,REF1,PAY1,TXN1,,0.00',
+                '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,--,PAY1,--,,0.00',
+                '"Apr 13, 2026",Other fee,--,USD,-1.00,0.00,0.00,0.00,0.00,Ad fee,--,PAY1,--,,0.00',
             ]
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
-            first_path = Path(tmp_dir) / "report-a.csv"
-            second_path = Path(tmp_dir) / "report-b.csv"
-            first_path.write_text(report_text, encoding="utf-8")
-            second_path.write_text(report_text, encoding="utf-8")
+            path = Path(tmp_dir) / "report.csv"
+            path.write_text(report_text, encoding="utf-8")
+            combined = parse_ebay_reports((path,))
 
-            separate_first = parse_ebay_report(first_path)
-            separate_second = parse_ebay_report(second_path)
-            combined = parse_ebay_reports((first_path, second_path))
-
-        self.assertEqual(separate_first.report_rows[0].row_id, separate_second.report_rows[0].row_id)
         self.assertEqual(len(combined.report_rows), 2)
-        self.assertEqual(combined.report_rows[0].row_id, separate_first.report_rows[0].row_id)
         self.assertNotEqual(combined.report_rows[0].row_id, combined.report_rows[1].row_id)
 
     def test_parse_etsy_statement_extracts_listing_ids(self) -> None:

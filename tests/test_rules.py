@@ -12,6 +12,8 @@ from market2gnucash.core.models import (
     BankImportSpec,
     EbayInputData,
     EbayReportRow,
+    EtsyInputData,
+    EtsyStatementRow,
     MappingConfig,
     MarketplaceAccountMapping,
     PlannedSplit,
@@ -49,6 +51,7 @@ class RuleEngineTests(unittest.TestCase):
             "etsy:Fee:Processing fee": "guid-exp-fee",
             "etsy:Fee:Credit for transaction fee on shipping": "guid-exp-fee",
             "etsy:Fee:Credit for processing fee": "guid-exp-fee",
+            "etsy:Shipping:USPS shipping label": "guid-exp-shipping-label",
         }
         return MappingConfig(
             marketplace_accounts={
@@ -80,6 +83,49 @@ class RuleEngineTests(unittest.TestCase):
 
     def _bank_mapping(self, account_key: str = "etsy:shop-a", account_label: str = "Etsy Shop A") -> MappingConfig:
         return self._etsy_mapping(account_key=account_key, account_label=account_label)
+
+    def test_etsy_shipping_label_rows_build_categorized_transactions(self) -> None:
+        data = EtsyInputData(
+            statement_rows=(
+                EtsyStatementRow(
+                    row_id="shipping-row",
+                    row_number=1,
+                    date=date(2026, 6, 27),
+                    row_type="Shipping",
+                    title="USPS shipping label",
+                    info="Receipt #4102439019",
+                    currency="USD",
+                    amount=Decimal("-5.73"),
+                    fees_taxes=None,
+                    net=Decimal("-5.73"),
+                    tax_details="",
+                    order_id=None,
+                    listing_id=None,
+                    raw={},
+                ),
+            ),
+            sold_orders=(),
+        )
+
+        transactions, warnings, mapping_keys = build_etsy_transactions(
+            data,
+            self._etsy_mapping(),
+            account_key="etsy:shop-a",
+            account_label="Etsy Shop A",
+        )
+
+        self.assertEqual(warnings, ())
+        self.assertIn("etsy:Shipping:USPS shipping label", mapping_keys)
+        self.assertEqual(len(transactions), 1)
+        txn = transactions[0]
+        self.assertEqual(txn.txn_kind, "shipping_label")
+        self.assertEqual(txn.clearing_amount, Decimal("-5.73"))
+        self.assertEqual(sum(split.amount for split in txn.splits), Decimal("0.00"))
+        self.assertEqual(txn.splits[0].account_guid, "guid-asset-etsy")
+        self.assertEqual(txn.splits[0].amount, Decimal("-5.73"))
+        self.assertEqual(txn.splits[1].account_guid, "guid-exp-shipping-label")
+        self.assertEqual(txn.splits[1].amount, Decimal("5.73"))
+        self.assertEqual(txn.splits[1].mapping_key, "etsy:Shipping:USPS shipping label")
 
     def test_etsy_rules_one_sale_per_order_and_listing_per_row(self) -> None:
         etsy_data = parse_etsy_inputs(

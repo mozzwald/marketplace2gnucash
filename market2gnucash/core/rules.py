@@ -66,6 +66,13 @@ def etsy_mapping_key_candidates(row: EtsyStatementRow) -> tuple[str, ...]:
     return (exact,)
 
 
+def is_etsy_shipping_label(row: EtsyStatementRow) -> bool:
+    title = row.title.lower()
+    return row.row_type == "Shipping label" or (
+        row.row_type == "Shipping" and "shipping label" in title
+    )
+
+
 def ebay_mapping_key(column_name: str) -> str:
     return f"ebay:fee_col:{column_name}"
 
@@ -238,6 +245,8 @@ def build_etsy_transactions(
             mapping_keys.add(etsy_mapping_key(row))
             if row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
                 mapping_keys.add("etsy:Fee:Transaction fee:*")
+        if is_etsy_shipping_label(row):
+            mapping_keys.add(etsy_mapping_key(row))
         if row.order_id:
             rows_by_order[row.order_id].append(row)
 
@@ -404,6 +413,68 @@ def build_etsy_transactions(
                 )
             )
             consumed_rows.add(row.row_id)
+
+    for row in statement_rows:
+        if row.row_id in consumed_rows or not is_etsy_shipping_label(row):
+            continue
+        net = row.net or ZERO
+        if net == ZERO:
+            consumed_rows.add(row.row_id)
+            continue
+
+        shipping_warnings: list[str] = []
+        mapping_key = etsy_mapping_key(row)
+        account_guid = account_mapping.fee_accounts.get(mapping_key)
+        if account_guid is None:
+            shipping_warnings.append(f"UNMAPPED: No Etsy mapping for {mapping_key}")
+
+        splits: list[PlannedSplit] = []
+        if account_mapping.clearing_guid:
+            splits.append(
+                PlannedSplit(
+                    account_guid=account_mapping.clearing_guid,
+                    amount=net,
+                    memo="Shipping label clearing",
+                    mapping_key="etsy:clearing",
+                )
+            )
+        else:
+            shipping_warnings.append("MISSING_ACCOUNT: Etsy clearing account is not selected")
+            splits.append(
+                PlannedSplit(
+                    account_guid=None,
+                    amount=net,
+                    memo="Shipping label clearing",
+                    mapping_key="etsy:clearing",
+                )
+            )
+        splits.append(
+            PlannedSplit(
+                account_guid=account_guid,
+                amount=-net,
+                memo=row.title,
+                mapping_key=mapping_key,
+            )
+        )
+
+        transactions.append(
+            _finalize_transaction(
+                dedupe_key=f"etsy:shipping_label:{account_key}:{row.row_id}",
+                marketplace="etsy",
+                marketplace_account_key=account_key,
+                marketplace_account_label=account_label,
+                txn_kind="shipping_label",
+                txn_id=row.row_id,
+                txn_date=row.date,
+                description=_first_nonempty(row.title, row.info, "Etsy Shipping Label") or "Etsy Shipping Label",
+                external_ref=row.info or row.row_id,
+                clearing_amount=net,
+                splits=splits,
+                source_row_ids=[row.row_id],
+                warnings=shipping_warnings,
+            )
+        )
+        consumed_rows.add(row.row_id)
 
     adjustments_by_order_date: dict[tuple[str, date], list[EtsyStatementRow]] = defaultdict(list)
     for row in statement_rows:

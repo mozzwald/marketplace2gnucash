@@ -25,6 +25,7 @@ from market2gnucash.core.rules import (
     ebay_mapping_key,
     ebay_standalone_fee_mapping_key,
     etsy_mapping_key,
+    is_etsy_shipping_label,
 )
 from market2gnucash.ui.account_picker import AccountPickerDialog
 
@@ -257,10 +258,10 @@ class MappingTab(QWidget):
                                 end_date,
                             )
                             for row in statement_rows:
-                                if row.row_type != "Fee":
+                                if row.row_type != "Fee" and not is_etsy_shipping_label(row):
                                     continue
                                 found_keys.add(etsy_mapping_key(row))
-                                if row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
+                                if row.row_type == "Fee" and row.title.startswith("Transaction fee:") and row.title != "Transaction fee: Shipping":
                                     found_keys.add("etsy:Fee:Transaction fee:*")
                 if marketplace_import["marketplace"] == "ebay":
                     report_directory = marketplace_import.get("ebay_report_directory")
